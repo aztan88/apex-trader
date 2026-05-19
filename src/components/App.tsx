@@ -507,7 +507,7 @@ function PortfolioChart({ history }: { history: {ts:number;value:number}[] }) {
 
 // ── Autopilot cycle (FIX #18: fully wired) ───────────────────────────────────
 async function runAutopilotCycle(
-  store: ReturnType<typeof useTraderStore>,
+  store: { current: () => { cash: number; positions: Record<string, any> }; buy: (...a: any[]) => boolean; sell: (...a: any[]) => boolean },
   risk: string, maxPct: number, stopPct: number, tpPct: number,
   totalValue: number, addLog: (msg: string) => void, showToast: (m: string, t?: any) => void
 ) {
