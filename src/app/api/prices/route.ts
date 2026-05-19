@@ -1,6 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-// FIX #6: static top-level import, not dynamic import inside handler
-import yahooFinance from 'yahoo-finance2';
 
 const priceCache = new Map<string, { data: StockPrice; ts: number }>();
 const CACHE_TTL = 5 * 60 * 1000;
@@ -20,42 +18,48 @@ function fmtCap(n: number): string {
   return n.toLocaleString();
 }
 
+// Dynamic import prevents Next.js webpack from bundling yahoo-finance2
+// (which triggers its test files with missing Deno deps at build time)
+async function getYF() {
+  const mod = await import('yahoo-finance2');
+  return (mod.default ?? mod) as any;
+}
+
 async function fetchYahoo(ticker: string): Promise<StockPrice | null> {
   try {
-    // FIX #20: parallel requests for quote + history
+    const yf = await getYF();
     const [quote, hist] = await Promise.all([
-      yahooFinance.quote(ticker, {}, { validateResult: false }),
-      yahooFinance.chart(ticker, {
+      yf.quote(ticker, {}, { validateResult: false }),
+      yf.chart(ticker, {
         period1: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
         interval: '1d',
       }, { validateResult: false }).catch(() => null),
     ]);
     if (!quote?.regularMarketPrice) return null;
-
-    const closes = (hist?.quotes ?? [])
+    const closes: number[] = (hist?.quotes ?? [])
       .map((q: any) => q.close)
       .filter((c: any): c is number => typeof c === 'number' && c > 0);
     const history = closes.slice(-30);
     const yearAgo = closes[0] ?? quote.regularMarketPrice;
     const change52w = yearAgo > 0 ? ((quote.regularMarketPrice - yearAgo) / yearAgo) * 100 : 0;
-
     return {
-      ticker: quote.symbol ?? ticker,
-      name: quote.longName ?? quote.shortName ?? ticker,
+      ticker: String(quote.symbol ?? ticker),
+      name: String(quote.longName ?? quote.shortName ?? ticker),
       price: Math.round(quote.regularMarketPrice * 100) / 100,
       change1d: Math.round((quote.regularMarketChangePercent ?? 0) * 100) / 100,
       change52w: Math.round(change52w * 100) / 100,
       marketCap: fmtCap(quote.marketCap ?? 0),
-      currency: quote.currency ?? 'USD',
-      exchange: quote.fullExchangeName ?? quote.exchange ?? 'NASDAQ',
-      sector: (quote as any).sector ?? 'Equity',
+      currency: String(quote.currency ?? 'USD'),
+      exchange: String(quote.fullExchangeName ?? quote.exchange ?? 'NASDAQ'),
+      sector: String(quote.sector ?? 'Equity'),
       high52w: quote.fiftyTwoWeekHigh ?? 0,
       low52w: quote.fiftyTwoWeekLow ?? 0,
       volume: quote.regularMarketVolume ?? 0,
-      history, source: 'Yahoo Finance',
+      history,
+      source: 'Yahoo Finance',
     };
   } catch (e: any) {
-    console.warn(`[prices] Yahoo error ${ticker}:`, e?.message?.slice(0, 80));
+    console.warn(`[prices] Yahoo ${ticker}:`, String(e?.message ?? '').slice(0, 80));
     return null;
   }
 }
@@ -64,8 +68,7 @@ async function fetchAlphaVantage(ticker: string): Promise<StockPrice | null> {
   const key = process.env.ALPHA_VANTAGE_KEY;
   if (!key || key === 'demo') return null;
   try {
-    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${key}`;
-    const res = await fetch(url, { next: { revalidate: 300 } });
+    const res = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${key}`);
     if (!res.ok) return null;
     const data = await res.json();
     const q = data['Global Quote'];
@@ -84,11 +87,11 @@ async function fetchAlphaVantage(ticker: string): Promise<StockPrice | null> {
   } catch { return null; }
 }
 
-async function enrichWithFinnhub(ticker: string, base: StockPrice): Promise<StockPrice> {
+async function enrichFinnhub(ticker: string, base: StockPrice): Promise<StockPrice> {
   const key = process.env.FINNHUB_KEY;
-  if (!key || base.name !== ticker) return base; // only enrich if name is still just ticker
+  if (!key || base.name !== ticker) return base;
   try {
-    const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${key}`, { next: { revalidate: 86400 } });
+    const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${key}`);
     if (!res.ok) return base;
     const p = await res.json();
     return {
@@ -105,19 +108,18 @@ async function getPrice(ticker: string): Promise<StockPrice> {
   const t = ticker.toUpperCase().trim();
   const cached = priceCache.get(t);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.data;
-
   let result = await fetchYahoo(t);
   if (!result || result.price <= 0) result = await fetchAlphaVantage(t);
   if (result && result.price > 0) {
-    result = await enrichWithFinnhub(t, result);
+    result = await enrichFinnhub(t, result);
     priceCache.set(t, { data: result, ts: Date.now() });
     return result;
   }
   return {
-    ticker: t, name: t, price: 0, change1d: 0, change52w: 0, marketCap: 'N/A',
-    currency: 'USD', exchange: 'N/A', sector: 'Equity',
+    ticker: t, name: t, price: 0, change1d: 0, change52w: 0,
+    marketCap: 'N/A', currency: 'USD', exchange: 'N/A', sector: 'Equity',
     high52w: 0, low52w: 0, volume: 0, history: [],
-    source: 'unavailable', error: `No data for ${t}`,
+    source: 'unavailable', error: `No price data for ${t}`,
   };
 }
 
@@ -125,15 +127,12 @@ export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get('tickers') ?? '';
   const tickers = raw.split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 20);
   if (!tickers.length) return NextResponse.json({ error: 'No tickers provided' }, { status: 400 });
-
-  // FIX #20: all tickers fetched in parallel
   const results = await Promise.all(tickers.map(getPrice));
   const map: Record<string, StockPrice> = {};
-  // FIX #1: store under both raw ticker and display ticker so ASX lookups work
   results.forEach(r => {
     map[r.ticker] = r;
-    map[r.ticker.replace('.AX', '').replace('-USD', '')] = r;
+    const clean = r.ticker.replace('.AX', '').replace('-USD', '');
+    if (clean !== r.ticker) map[clean] = r;
   });
-
   return NextResponse.json(map, { headers: { 'Cache-Control': 's-maxage=300, stale-while-revalidate=60' } });
 }
