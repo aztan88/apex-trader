@@ -433,7 +433,7 @@ function OrderModal({ stock, onClose, showToast }: {
                 <div className="flex justify-between border-t border-white/5 pt-1.5">
                   <span className="text-white/35">Cash after</span>
                   <span className={`font-mono ${side === 'buy' ? (after < 0 ? 'text-red-400' : 'text-green-400') : 'text-green-400'}`}>
-                    ${fmt(side === 'buy' ? after : store.cash + total)}
+                    ${fmt(side === 'buy' ? after : current.cash + total)}
                   </span>
                 </div>
                 {/* FIX #10: show portfolio % */}
@@ -511,13 +511,13 @@ async function runAutopilotCycle(
   risk: string, maxPct: number, stopPct: number, tpPct: number,
   totalValue: number, addLog: (msg: string) => void, showToast: (m: string, t?: any) => void
 ) {
-  const positions = store.positions;
+  const positions = store.current().positions;
   const keys = Object.keys(positions);
   const posStr = keys.length
     ? keys.map(k => { const p = positions[k]; const pnlPct = (p.currentPrice - p.avgPrice) / p.avgPrice * 100; return `${k}:pnl${pnlPct.toFixed(1)}%`; }).join(',')
     : 'none';
 
-  const prompt = `Portfolio: cash $${store.cash.toFixed(0)} of $${totalValue.toFixed(0)} total, positions: ${posStr}
+  const prompt = `Portfolio: cash $${store.current().cash.toFixed(0)} of $${totalValue.toFixed(0)} total, positions: ${posStr}
 Risk profile: ${risk} | Max per trade: ${maxPct}% | Auto stop: ${stopPct}% | Auto take-profit: ${tpPct}%
 Return max 3 pipe-delimited action lines then SUMMARY|sentence. Format: ACTION|TICKER|REASON(max 8 words)
 ACTION = buy/sell/trim/hold. Only sell if pnl < -${stopPct} or > ${tpPct}. Only buy if cash > 15% of total.`;
@@ -537,17 +537,17 @@ ACTION = buy/sell/trim/hold. Only sell if pnl < -${stopPct} or > ${tpPct}. Only 
       const ticker = parts[1].trim().toUpperCase();
       const reason = (parts[2] ?? '').trim();
       if (action === 'summary') { addLog(`📊 ${reason || ticker}`); continue; }
-      if ((action === 'buy') && store.cash > totalValue * 0.15) {
+      if ((action === 'buy') && store.current().cash > totalValue * 0.15) {
         const budget = totalValue * maxPct / 100;
-        const existingPos = store.positions[ticker];
+        const existingPos = store.current().positions[ticker];
         const price = existingPos?.currentPrice ?? 100;
         const shares = Math.max(1, Math.floor(budget / price));
         const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
         const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
         const ok = store.buy({ ticker, name: ticker, price, exchange: 'AUTO', sector: 'Equity' }, shares, sl, tp, 'auto');
         if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
-      } else if ((action === 'sell' || action === 'trim') && store.positions[ticker]) {
-        const pos = store.positions[ticker];
+      } else if ((action === 'sell' || action === 'trim') && store.current().positions[ticker]) {
+        const pos = store.current().positions[ticker];
         const shares = action === 'trim' ? Math.max(1, Math.floor(pos.shares / 2)) : pos.shares;
         store.sell(ticker, shares, pos.currentPrice, 'auto');
         addLog(`🔴 ${action.toUpperCase()} ${shares}× ${ticker} — ${reason}`);
@@ -682,7 +682,7 @@ function AppInner() {
   // Price tick simulation
   useEffect(() => {
     const tick = () => {
-      const positions = store.positions;
+      const positions = store.current().positions;
       for (const [ticker, pos] of Object.entries(positions)) {
         const vol = pos.sector === 'Crypto' ? 0.02 : pos.sector === 'Technology' ? 0.009 : 0.006;
         const newPrice = Math.max(0.01, pos.currentPrice * (1 + 0.0002 + (Math.random() - 0.485) * vol));
@@ -1064,10 +1064,10 @@ function AppInner() {
               </div>
 
               {/* FIX #8: Portfolio chart */}
-              {store.history.length > 1 && (
+              {current.history.length > 1 && (
                 <div className="bg-[#13131f] border border-white/5 rounded-xl p-4 mb-5">
                   <div className="text-[10px] text-white/25 uppercase tracking-wide mb-3">Portfolio Growth</div>
-                  <PortfolioChart history={store.history} />
+                  <PortfolioChart history={current.history} />
                 </div>
               )}
 
