@@ -742,7 +742,15 @@ function AppInner() {
       setScreenStatus(`Fetching live prices for ${tickers.length} stocks…`);
       // FIX #20: prices fetched in parallel server-side, signals fetched in parallel here
       const priceMap = await fetchPrices(tickers);
-      setScreenStatus('Prices loaded · Generating AI signals…');
+      const successfulPrices = Object.values(priceMap).filter((v: any) => v.price > 0).length;
+      if (successfulPrices === 0) {
+        setScreenStatus('Price API returned no data. Yahoo Finance may be rate-limited — try again in 30 seconds.');
+        showToast('No price data returned. Try again shortly.', 'err');
+        setScreenLoading(false);
+        setScreeningCount(0);
+        return;
+      }
+      setScreenStatus(`Prices loaded (${successfulPrices}/${tickers.length}) · Generating AI signals…`);
 
       // FIX #20: fetch all signals in parallel
       const signalJobs = tickers.map(async tk => {
@@ -763,7 +771,10 @@ function AppInner() {
             high52w: mkt.high52w ?? 0, low52w: mkt.low52w ?? 0, volume: mkt.volume ?? 0,
             ...sig,
           } as StockCard;
-        } catch { return null; }
+        } catch (e: any) {
+          console.error('[screener] signal error for', tk, e?.message);
+          return null;
+        }
       });
 
       // Show cards as they arrive using Promise.allSettled + progressive update
@@ -777,7 +788,13 @@ function AppInner() {
         }
       }
       setScreeningCount(0);
-      setScreenStatus(`${results.length} stocks · ${[...new Set(results.map(s => s.source.replace(' (Live)','').replace('Yahoo Finance','Yahoo Finance')))].join(', ')}`);
+      if (results.length === 0) {
+        setScreenStatus('No data returned — check ANTHROPIC_API_KEY is set in Vercel Environment Variables');
+        showToast('No stocks loaded. Is your ANTHROPIC_API_KEY set in Vercel?', 'err');
+      } else {
+        const sources = [...new Set(results.map(s => (s.source || 'unknown').replace(' (Live)','')))];
+        setScreenStatus(`${results.length} stocks · ${sources.join(', ')}`);
+      }
     } catch (e: any) {
       setScreenStatus('Error: ' + e.message);
       showToast('Screener error: ' + e.message, 'err');
@@ -799,7 +816,12 @@ function AppInner() {
         }),
       });
       const data = await res.json();
-      const tickers = data.reply.replace(/[^A-Z0-9.,\-]/gi, '').split(',')
+      if (!res.ok || !data.reply) {
+        showToast('AI service unavailable — check ANTHROPIC_API_KEY in Vercel environment variables', 'err');
+        setSearching(false);
+        return;
+      }
+      const tickers = String(data.reply).replace(/[^A-Z0-9.,\-]/gi, '').split(',')
         .map((t: string) => t.trim()).filter(Boolean).slice(0, 6);
       if (!tickers.length) { showToast('No tickers found for that search', 'err'); setSearching(false); return; }
       const priceMap = await fetchPrices(tickers);
