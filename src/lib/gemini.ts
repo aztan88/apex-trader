@@ -1,7 +1,7 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-// Gemini 1.5 Flash — free tier, 15 req/min, 1500 req/day
-const MODEL = 'gemini-1.5-flash';
+// gemini-2.5-flash-lite — free tier, fast, current stable model as of May 2026
+const MODEL = 'gemini-2.5-flash-lite';
 
 function getClient() {
   const key = process.env.GEMINI_API_KEY;
