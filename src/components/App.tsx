@@ -717,18 +717,20 @@ function AppInner() {
   // FIX #18: Autopilot properly wired
   useEffect(() => {
     if (apOn) {
+      // Restart the cycle immediately with new settings whenever any setting changes
+      if (apIntervalRef.current) clearInterval(apIntervalRef.current);
       const cycle = () => runAutopilotCycle(
         store, apRisk, apMax, apStop, apTp, totalValue,
         (msg) => setApLog(l => [{ ts: Date.now(), msg }, ...l].slice(0, 60)),
         showToast
       );
-      cycle(); // immediate first run
+      cycle(); // run immediately with new settings
       apIntervalRef.current = setInterval(cycle, 30000);
     } else {
       if (apIntervalRef.current) { clearInterval(apIntervalRef.current); apIntervalRef.current = null; }
     }
     return () => { if (apIntervalRef.current) clearInterval(apIntervalRef.current); };
-  }, [apOn]);
+  }, [apOn, apRisk, apMax, apStop, apTp]); // re-run whenever any setting changes
 
   // ── Screener ────────────────────────────────────────────────────────────
   const runScreener = async () => {
