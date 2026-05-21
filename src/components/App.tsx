@@ -789,8 +789,8 @@ function AppInner() {
       }
       setScreeningCount(0);
       if (results.length === 0) {
-        setScreenStatus('No data returned — check ANTHROPIC_API_KEY is set in Vercel Environment Variables');
-        showToast('No stocks loaded. Is your ANTHROPIC_API_KEY set in Vercel?', 'err');
+        setScreenStatus('No data returned — check GEMINI_API_KEY is set in Vercel Environment Variables, then redeploy');
+        showToast('No stocks loaded. Check /api/health to diagnose.', 'err');
       } else {
         const sources = [...new Set(results.map(s => (s.source || 'unknown').replace(' (Live)','')))];
         setScreenStatus(`${results.length} stocks · ${sources.join(', ')}`);
@@ -817,7 +817,9 @@ function AppInner() {
       });
       const data = await res.json();
       if (!res.ok || !data.reply) {
-        showToast('AI service unavailable — check ANTHROPIC_API_KEY in Vercel environment variables', 'err');
+        const reason = data.error ?? 'Unknown error';
+        showToast(`Search failed: ${reason}`, 'err');
+        console.error('[search] coach API error:', data);
         setSearching(false);
         return;
       }
