@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
-
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { gemini } from '@/lib/gemini';
 
 export async function POST(req: NextRequest) {
   try {
@@ -9,21 +7,18 @@ export async function POST(req: NextRequest) {
     const { question, portfolioContext } = body;
     if (!question) return NextResponse.json({ error: 'question required' }, { status: 400 });
 
-    const msg = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 700,
-      system: 'You are an expert investment coach with decades of experience managing global equity portfolios. Give specific, actionable, educational advice. Use clear paragraphs. Be direct and honest. No boilerplate disclaimers. No generic statements.',
-      messages: [{
-        role: 'user',
-        content: portfolioContext
-          ? `${portfolioContext}\n\nQuestion: ${question}`
-          : question,
-      }],
-    });
+    const userPrompt = portfolioContext
+      ? `${portfolioContext}\n\nQuestion: ${question}`
+      : question;
 
-    const reply = (msg.content[0] as any).text;
-    return NextResponse.json({ reply, inputTokens: msg.usage.input_tokens, outputTokens: msg.usage.output_tokens });
+    const reply = await gemini(
+      'You are an expert investment coach with decades of experience. Give specific, actionable, educational advice. Use clear paragraphs. Be direct and honest. No boilerplate disclaimers.',
+      userPrompt,
+      700
+    );
+    return NextResponse.json({ reply });
   } catch (e: any) {
+    console.error('[coach] Error:', e?.message);
     return NextResponse.json({ error: e.message }, { status: 500 });
   }
 }
