@@ -3,26 +3,29 @@ import { NextResponse } from 'next/server';
 export async function GET() {
   const checks: Record<string, any> = {};
 
-  // Check 1: Gemini key present
-  checks.gemini_key_set = !!process.env.GEMINI_API_KEY;
+  checks.groq_key_set = !!process.env.GROQ_API_KEY;
 
-  // Check 2: Test Gemini API works
-  if (checks.gemini_key_set) {
+  if (checks.groq_key_set) {
     try {
-      const { geminiSimple } = await import('@/lib/gemini');
-      const result = await geminiSimple('Reply with the single word: ok', 10);
-      checks.gemini_api_works = result.toLowerCase().includes('ok');
-      checks.gemini_response = result.trim().slice(0,20);
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 5, messages: [{ role: 'user', content: 'ping' }] }),
+      });
+      checks.groq_api_works = res.ok;
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        checks.groq_error = (err as any)?.error?.message ?? `HTTP ${res.status}`;
+      }
     } catch (e: any) {
-      checks.gemini_api_works = false;
-      checks.gemini_error = e.message?.slice(0,100);
+      checks.groq_api_works = false;
+      checks.groq_error = e.message?.slice(0,100);
     }
   } else {
-    checks.gemini_api_works = false;
-    checks.gemini_error = 'GEMINI_API_KEY not set in Vercel Environment Variables';
+    checks.groq_api_works = false;
+    checks.groq_error = 'GROQ_API_KEY not set in Vercel Environment Variables';
   }
 
-  // Check 3: Yahoo Finance
   try {
     const yf = await import('yahoo-finance2');
     const lib = (yf.default ?? yf) as any;
@@ -34,15 +37,14 @@ export async function GET() {
     checks.yahoo_error = e.message?.slice(0,100);
   }
 
-  // Check 4: Optional
+  checks.gemini_key_set = !!process.env.GEMINI_API_KEY;
   checks.alpha_vantage_set = !!process.env.ALPHA_VANTAGE_KEY;
-  checks.finnhub_set = !!process.env.FINNHUB_KEY;
   checks.broker = process.env.BROKER ?? 'paper';
 
-  const ok = checks.gemini_api_works && checks.yahoo_finance;
+  const ok = checks.groq_api_works && checks.yahoo_finance;
   return NextResponse.json({
     status: ok ? 'ok' : 'degraded',
     checks,
-    message: ok ? 'All systems operational' : 'See checks above for what needs fixing',
+    message: ok ? 'All systems operational' : 'See checks above',
   }, { status: ok ? 200 : 503 });
 }

@@ -809,42 +809,50 @@ function AppInner() {
     setSearching(true);
     setStocks([]);
     try {
-      const res = await fetch('/api/coach', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: `List 6 stock tickers matching: "${searchQ}". Return only comma-separated tickers. Use Yahoo Finance format (AAPL, BHP.AX, BTC-USD). Nothing else.`,
-        }),
-      });
+      // Use dedicated search endpoint — static map for common stocks, Gemini fallback
+      const res = await fetch(`/api/search?q=${encodeURIComponent(searchQ.trim())}`);
       const data = await res.json();
-      if (!res.ok || !data.reply) {
-        const reason = data.error ?? 'Unknown error';
-        showToast(`Search failed: ${reason}`, 'err');
-        console.error('[search] coach API error:', data);
+
+      if (!res.ok || !data.tickers || data.tickers.length === 0) {
+        showToast(`No tickers found for "${searchQ}" — try a company name or ticker symbol`, 'err');
         setSearching(false);
         return;
       }
-      const tickers = String(data.reply).replace(/[^A-Z0-9.,\-]/gi, '').split(',')
-        .map((t: string) => t.trim()).filter(Boolean).slice(0, 6);
-      if (!tickers.length) { showToast('No tickers found for that search', 'err'); setSearching(false); return; }
+
+      const tickers: string[] = data.tickers;
       const priceMap = await fetchPrices(tickers);
       const results: StockCard[] = [];
+
       for (const tk of tickers) {
         const mkt = priceMap[tk] ?? priceMap[tk.replace('.AX','').replace('-USD','')];
         if (!mkt || mkt.error || mkt.price <= 0) continue;
-        const sig = await fetchSignals(tk, mkt.price, mkt.name || tk, { change52w: mkt.change52w, marketCap: mkt.marketCap, sector: mkt.sector, exchange: mkt.exchange });
-        results.push({
-          ticker: tk.replace('.AX','').replace('-USD',''), name: sig.name || mkt.name || tk,
-          price: mkt.price, change1d: mkt.change1d, change52w: mkt.change52w,
-          marketCap: mkt.marketCap, currency: mkt.currency, exchange: mkt.exchange,
-          sector: mkt.sector, source: mkt.source, history: mkt.history ?? [],
-          high52w: mkt.high52w ?? 0, low52w: mkt.low52w ?? 0, volume: mkt.volume ?? 0,
-          ...sig,
-        });
-        setStocks([...results]);
-        await new Promise(r => setTimeout(r, 50));
+        try {
+          const sig = await fetchSignals(tk, mkt.price, mkt.name || tk, {
+            change52w: mkt.change52w, marketCap: mkt.marketCap,
+            sector: mkt.sector, exchange: mkt.exchange,
+          });
+          results.push({
+            ticker: tk.replace('.AX','').replace('-USD',''),
+            name: sig.name || mkt.name || tk,
+            price: mkt.price, change1d: mkt.change1d, change52w: mkt.change52w,
+            marketCap: mkt.marketCap, currency: mkt.currency, exchange: mkt.exchange,
+            sector: mkt.sector, source: mkt.source, history: mkt.history ?? [],
+            high52w: mkt.high52w ?? 0, low52w: mkt.low52w ?? 0, volume: mkt.volume ?? 0,
+            ...sig,
+          });
+          setStocks([...results]);
+        } catch (e: any) {
+          console.warn('[search] signal error for', tk, e?.message);
+        }
+        await new Promise(r => setTimeout(r, 100));
       }
-      if (!results.length) showToast('No data available for those tickers', 'err');
-    } catch (e: any) { showToast('Search error: ' + e.message, 'err'); }
+
+      if (results.length === 0) {
+        showToast('Price data unavailable for those tickers — try again shortly', 'err');
+      }
+    } catch (e: any) {
+      showToast('Search error: ' + e.message, 'err');
+    }
     setSearching(false);
   };
 
