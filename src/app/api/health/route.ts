@@ -3,8 +3,8 @@ import { NextResponse } from 'next/server';
 export async function GET() {
   const checks: Record<string, any> = {};
 
+  // Check 1: Groq API
   checks.groq_key_set = !!process.env.GROQ_API_KEY;
-
   if (checks.groq_key_set) {
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -13,32 +13,38 @@ export async function GET() {
         body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 5, messages: [{ role: 'user', content: 'ping' }] }),
       });
       checks.groq_api_works = res.ok;
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        checks.groq_error = (err as any)?.error?.message ?? `HTTP ${res.status}`;
-      }
+      if (!res.ok) checks.groq_error = `HTTP ${res.status}`;
     } catch (e: any) {
       checks.groq_api_works = false;
-      checks.groq_error = e.message?.slice(0,100);
+      checks.groq_error = e.message?.slice(0, 100);
     }
   } else {
     checks.groq_api_works = false;
     checks.groq_error = 'GROQ_API_KEY not set in Vercel Environment Variables';
   }
 
+  // Check 2: Yahoo Finance direct API
   try {
-    const yf = await import('yahoo-finance2');
-    const lib = (yf.default ?? yf) as any;
-    const quote = await lib.quote('AAPL', {}, { validateResult: false });
-    checks.yahoo_finance = (quote?.regularMarketPrice ?? 0) > 0;
-    checks.aapl_price = quote?.regularMarketPrice ?? null;
+    const res = await fetch(
+      'https://query1.finance.yahoo.com/v8/finance/chart/AAPL?interval=1d&range=5d',
+      { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ApexTrader/1.0)' }, signal: AbortSignal.timeout(8000) }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+      checks.yahoo_finance = !!price && price > 0;
+      checks.aapl_price = price ?? null;
+    } else {
+      checks.yahoo_finance = false;
+      checks.yahoo_error = `HTTP ${res.status}`;
+    }
   } catch (e: any) {
     checks.yahoo_finance = false;
-    checks.yahoo_error = e.message?.slice(0,100);
+    checks.yahoo_error = e.message?.slice(0, 100);
   }
 
-  checks.gemini_key_set = !!process.env.GEMINI_API_KEY;
   checks.alpha_vantage_set = !!process.env.ALPHA_VANTAGE_KEY;
+  checks.twelve_data_set = !!process.env.TWELVE_DATA_KEY;
   checks.broker = process.env.BROKER ?? 'paper';
 
   const ok = checks.groq_api_works && checks.yahoo_finance;

@@ -18,57 +18,126 @@ function fmtCap(n: number): string {
   return n.toLocaleString();
 }
 
-// Dynamic import prevents Next.js webpack from bundling yahoo-finance2
-// (which triggers its test files with missing Deno deps at build time)
-async function getYF() {
-  const mod = await import('yahoo-finance2');
-  return (mod.default ?? mod) as any;
-}
-
-async function fetchYahoo(ticker: string): Promise<StockPrice | null> {
+// ── Source 1: Yahoo Finance v8 API (direct fetch, no npm package) ─────────────
+async function fetchYahooV8(ticker: string): Promise<StockPrice | null> {
   try {
-    const yf = await getYF();
-    const [quote, hist] = await Promise.all([
-      yf.quote(ticker, {}, { validateResult: false }),
-      yf.chart(ticker, {
-        period1: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
-        interval: '1d',
-      }, { validateResult: false }).catch(() => null),
-    ]);
-    if (!quote?.regularMarketPrice) return null;
-    const closes: number[] = (hist?.quotes ?? [])
-      .map((q: any) => q.close)
-      .filter((c: any): c is number => typeof c === 'number' && c > 0);
-    const history = closes.slice(-30);
-    const yearAgo = closes[0] ?? quote.regularMarketPrice;
-    const change52w = yearAgo > 0 ? ((quote.regularMarketPrice - yearAgo) / yearAgo) * 100 : 0;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1y`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ApexTrader/1.0)',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+    const meta = result.meta;
+    const price = meta.regularMarketPrice ?? meta.previousClose;
+    if (!price || price <= 0) return null;
+    const closes: number[] = (result.indicators?.quote?.[0]?.close ?? [])
+      .filter((c: any) => typeof c === 'number' && c > 0);
+    const yearAgo = closes[0] ?? price;
+    const change52w = yearAgo > 0 ? ((price - yearAgo) / yearAgo) * 100 : 0;
     return {
-      ticker: String(quote.symbol ?? ticker),
-      name: String(quote.longName ?? quote.shortName ?? ticker),
-      price: Math.round(quote.regularMarketPrice * 100) / 100,
-      change1d: Math.round((quote.regularMarketChangePercent ?? 0) * 100) / 100,
+      ticker: String(meta.symbol ?? ticker),
+      name: String(meta.longName ?? meta.shortName ?? ticker),
+      price: Math.round(price * 100) / 100,
+      change1d: Math.round(((meta.regularMarketChangePercent ?? 0)) * 100) / 100,
       change52w: Math.round(change52w * 100) / 100,
-      marketCap: fmtCap(quote.marketCap ?? 0),
-      currency: String(quote.currency ?? 'USD'),
-      exchange: String(quote.fullExchangeName ?? quote.exchange ?? 'NASDAQ'),
-      sector: String(quote.sector ?? 'Equity'),
-      high52w: quote.fiftyTwoWeekHigh ?? 0,
-      low52w: quote.fiftyTwoWeekLow ?? 0,
-      volume: quote.regularMarketVolume ?? 0,
-      history,
+      marketCap: fmtCap(meta.marketCap ?? 0),
+      currency: String(meta.currency ?? 'USD'),
+      exchange: String(meta.fullExchangeName ?? meta.exchangeName ?? 'NYSE'),
+      sector: 'Equity',
+      high52w: meta.fiftyTwoWeekHigh ?? 0,
+      low52w: meta.fiftyTwoWeekLow ?? 0,
+      volume: meta.regularMarketVolume ?? 0,
+      history: closes.slice(-30),
       source: 'Yahoo Finance',
     };
   } catch (e: any) {
-    console.warn(`[prices] Yahoo ${ticker}:`, String(e?.message ?? '').slice(0, 80));
+    console.warn(`[prices] Yahoo v8 ${ticker}:`, String(e?.message ?? '').slice(0, 80));
     return null;
   }
 }
 
+// ── Source 2: Yahoo Finance v7 (fallback endpoint) ────────────────────────────
+async function fetchYahooV7(ticker: string): Promise<StockPrice | null> {
+  try {
+    const url = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ApexTrader/1.0)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const q = data?.quoteResponse?.result?.[0];
+    if (!q?.regularMarketPrice) return null;
+    return {
+      ticker: String(q.symbol ?? ticker),
+      name: String(q.longName ?? q.shortName ?? ticker),
+      price: Math.round(q.regularMarketPrice * 100) / 100,
+      change1d: Math.round((q.regularMarketChangePercent ?? 0) * 100) / 100,
+      change52w: Math.round((q.fiftyTwoWeekChangePercent ?? 0) * 100) / 100,
+      marketCap: fmtCap(q.marketCap ?? 0),
+      currency: String(q.currency ?? 'USD'),
+      exchange: String(q.fullExchangeName ?? q.exchange ?? 'NYSE'),
+      sector: String(q.sector ?? 'Equity'),
+      high52w: q.fiftyTwoWeekHigh ?? 0,
+      low52w: q.fiftyTwoWeekLow ?? 0,
+      volume: q.regularMarketVolume ?? 0,
+      history: [],
+      source: 'Yahoo Finance',
+    };
+  } catch (e: any) {
+    console.warn(`[prices] Yahoo v7 ${ticker}:`, String(e?.message ?? '').slice(0, 80));
+    return null;
+  }
+}
+
+// ── Source 3: Twelve Data free tier (800 req/day free) ───────────────────────
+async function fetchTwelveData(ticker: string): Promise<StockPrice | null> {
+  const key = process.env.TWELVE_DATA_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(
+      `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(ticker)}&apikey=${key}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (d.status === 'error' || !d.close) return null;
+    const price = parseFloat(d.close);
+    if (!price || price <= 0) return null;
+    return {
+      ticker: String(d.symbol ?? ticker),
+      name: String(d.name ?? ticker),
+      price: Math.round(price * 100) / 100,
+      change1d: parseFloat(d.percent_change ?? '0'),
+      change52w: parseFloat(d.fifty_two_week?.change_percentage ?? '0'),
+      marketCap: 'N/A',
+      currency: String(d.currency ?? 'USD'),
+      exchange: String(d.exchange ?? 'NYSE'),
+      sector: 'Equity',
+      high52w: parseFloat(d.fifty_two_week?.high ?? '0'),
+      low52w: parseFloat(d.fifty_two_week?.low ?? '0'),
+      volume: parseInt(d.volume ?? '0'),
+      history: [],
+      source: 'Twelve Data',
+    };
+  } catch { return null; }
+}
+
+// ── Source 4: Alpha Vantage ───────────────────────────────────────────────────
 async function fetchAlphaVantage(ticker: string): Promise<StockPrice | null> {
   const key = process.env.ALPHA_VANTAGE_KEY;
   if (!key || key === 'demo') return null;
   try {
-    const res = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${key}`);
+    const res = await fetch(
+      `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${key}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
     if (!res.ok) return null;
     const data = await res.json();
     const q = data['Global Quote'];
@@ -87,39 +156,35 @@ async function fetchAlphaVantage(ticker: string): Promise<StockPrice | null> {
   } catch { return null; }
 }
 
-async function enrichFinnhub(ticker: string, base: StockPrice): Promise<StockPrice> {
-  const key = process.env.FINNHUB_KEY;
-  if (!key || base.name !== ticker) return base;
-  try {
-    const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${key}`);
-    if (!res.ok) return base;
-    const p = await res.json();
-    return {
-      ...base,
-      name: p?.name ?? base.name,
-      sector: p?.finnhubIndustry ?? base.sector,
-      exchange: p?.exchange ?? base.exchange,
-      marketCap: p?.marketCapitalization ? fmtCap(p.marketCapitalization * 1e6) : base.marketCap,
-    };
-  } catch { return base; }
-}
-
+// ── Master fetcher — tries all sources in order ───────────────────────────────
 async function getPrice(ticker: string): Promise<StockPrice> {
   const t = ticker.toUpperCase().trim();
   const cached = priceCache.get(t);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.data;
-  let result = await fetchYahoo(t);
-  if (!result || result.price <= 0) result = await fetchAlphaVantage(t);
+
+  // Try all sources in parallel for speed, use first success
+  const [v8, v7] = await Promise.all([
+    fetchYahooV8(t),
+    fetchYahooV7(t),
+  ]);
+
+  let result = v8 ?? v7;
+
+  // Fallback to paid sources if Yahoo fails
+  if (!result || result.price <= 0) {
+    result = await fetchTwelveData(t) ?? await fetchAlphaVantage(t);
+  }
+
   if (result && result.price > 0) {
-    result = await enrichFinnhub(t, result);
     priceCache.set(t, { data: result, ts: Date.now() });
     return result;
   }
+
   return {
     ticker: t, name: t, price: 0, change1d: 0, change52w: 0,
     marketCap: 'N/A', currency: 'USD', exchange: 'N/A', sector: 'Equity',
     high52w: 0, low52w: 0, volume: 0, history: [],
-    source: 'unavailable', error: `No price data for ${t}`,
+    source: 'unavailable', error: `No price data available for ${t}`,
   };
 }
 
@@ -127,12 +192,17 @@ export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get('tickers') ?? '';
   const tickers = raw.split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 20);
   if (!tickers.length) return NextResponse.json({ error: 'No tickers provided' }, { status: 400 });
+
   const results = await Promise.all(tickers.map(getPrice));
   const map: Record<string, StockPrice> = {};
   results.forEach(r => {
     map[r.ticker] = r;
+    // Index without exchange suffix for easier lookup
     const clean = r.ticker.replace('.AX', '').replace('-USD', '');
     if (clean !== r.ticker) map[clean] = r;
   });
-  return NextResponse.json(map, { headers: { 'Cache-Control': 's-maxage=300, stale-while-revalidate=60' } });
+
+  return NextResponse.json(map, {
+    headers: { 'Cache-Control': 's-maxage=300, stale-while-revalidate=60' },
+  });
 }
