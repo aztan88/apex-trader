@@ -682,7 +682,7 @@ function WatchlistPage({ showToast, onViewDetail }: { showToast: (m: string, t?:
                         Quick Buy
                       </button>
                       <button onClick={() => onViewDetail && onViewDetail({
-                        ticker: tk.replace('.AX','').replace('-USD',''), apiTicker: tk,
+                        ticker: tk.replace('.AX','').replace('-USD',''),
                         name: mkt.name || tk, price: mkt.price, change1d: mkt.change1d,
                         change52w: mkt.change52w ?? 0, marketCap: mkt.marketCap ?? 'N/A',
                         currency: mkt.currency ?? 'USD', exchange: mkt.exchange ?? 'NYSE',
