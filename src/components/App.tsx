@@ -253,6 +253,7 @@ function OrderModal({ stock, onClose, showToast }: {
   const [side, setSide] = useState<'buy'|'sell'>('buy');
   const [confirmed, setConfirmed] = useState<{shares:number;price:number} | null>(null);
   const [executing, setExecuting] = useState(false);
+  const [showSentiment, setShowSentiment] = useState(false);
   const store = useTraderStore();
   const { mode } = store;
   const current = store.current();
@@ -396,6 +397,16 @@ function OrderModal({ stock, onClose, showToast }: {
               <span className="font-semibold">⚠ Key Risk: </span>{stock.risks}
             </div>
           )}
+          {/* Sentiment tab */}
+          {showSentiment && (
+            <div className="bg-[#1f1f2e] border border-white/8 rounded-xl p-4 mb-4">
+              <SentimentPanel ticker={stock.ticker} name={stock.name} price={stock.price} />
+            </div>
+          )}
+          <button onClick={() => setShowSentiment(v => !v)}
+            className="w-full py-2 text-xs text-white/40 bg-white/5 border border-white/8 rounded-lg hover:border-white/20 transition-colors mb-4">
+            {showSentiment ? '▲ Hide' : '▼ Show'} Market Sentiment & News
+          </button>
 
           {/* Order form */}
           <div className="space-y-3">
@@ -487,11 +498,28 @@ function PortfolioChart({ history }: { history: {ts:number;value:number}[] }) {
           datasets: [{
             data: vals, borderColor: col, backgroundColor: grad, fill: true,
             tension: 0.4, pointRadius: 0, borderWidth: 1.5,
+            pointHoverRadius: 4, pointHoverBackgroundColor: col,
           }],
         },
         options: {
           responsive: true, maintainAspectRatio: false,
-          plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c: any) => '$' + c.parsed.y.toLocaleString('en-AU', {minimumFractionDigits:2}) } } },
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              enabled: true,
+              backgroundColor: '#13131f',
+              borderColor: 'rgba(255,255,255,0.1)',
+              borderWidth: 1,
+              titleColor: '#9090b0',
+              bodyColor: '#f2f2f8',
+              padding: 10,
+              callbacks: {
+                title: (items: any[]) => items[0]?.label ?? '',
+                label: (c: any) => ' $' + c.parsed.y.toLocaleString('en-AU', {minimumFractionDigits:2, maximumFractionDigits:2}),
+              },
+            },
+          },
           scales: {
             x: { ticks: { color: '#50506a', font: { size: 9 }, maxTicksLimit: 6 }, grid: { color: 'rgba(255,255,255,0.03)' } },
             y: { ticks: { color: '#50506a', font: { size: 9 }, callback: (v: any) => '$' + Math.round(v / 1000) + 'k' }, grid: { color: 'rgba(255,255,255,0.03)' } },
@@ -509,18 +537,80 @@ function PortfolioChart({ history }: { history: {ts:number;value:number}[] }) {
 async function runAutopilotCycle(
   store: { current: () => { cash: number; positions: Record<string, any> }; buy: (...a: any[]) => boolean; sell: (...a: any[]) => boolean },
   risk: string, maxPct: number, stopPct: number, tpPct: number,
-  totalValue: number, addLog: (msg: string) => void, showToast: (m: string, t?: any) => void
+  totalValue: number, addLog: (msg: string) => void, showToast: (m: string, t?: any) => void,
+  minConviction = 6, maxPositions = 8, trailingStop = false
 ) {
-  const positions = store.current().positions;
+  const current = store.current();
+  const positions = current.positions;
   const keys = Object.keys(positions);
+
+  // Don't buy if already at max positions
+  const atMaxPositions = keys.length >= maxPositions;
+
   const posStr = keys.length
-    ? keys.map(k => { const p = positions[k]; const pnlPct = (p.currentPrice - p.avgPrice) / p.avgPrice * 100; return `${k}:pnl${pnlPct.toFixed(1)}%`; }).join(',')
+    ? keys.map(k => {
+        const p = positions[k];
+        const pnlPct = (p.currentPrice - p.avgPrice) / p.avgPrice * 100;
+        // Trailing stop: if enabled and stock is up, note that stop should trail
+        const trailNote = trailingStop && pnlPct > 5 ? '(trail)' : '';
+        return `${k}:pnl${pnlPct.toFixed(1)}%${trailNote}`;
+      }).join(',')
     : 'none';
 
-  const prompt = `Portfolio: cash $${store.current().cash.toFixed(0)} of $${totalValue.toFixed(0)} total, positions: ${posStr}
-Risk profile: ${risk} | Max per trade: ${maxPct}% | Auto stop: ${stopPct}% | Auto take-profit: ${tpPct}%
-Return max 3 pipe-delimited action lines then SUMMARY|sentence. Format: ACTION|TICKER|REASON(max 8 words)
-ACTION = buy/sell/trim/hold. Only sell if pnl < -${stopPct} or > ${tpPct}. Only buy if cash > 15% of total.`;
+  const prompt = `Portfolio: cash $${current.cash.toFixed(0)} of $${totalValue.toFixed(0)} total
+Positions (${keys.length}/${maxPositions} max): ${posStr}
+Risk: ${risk} | Max per trade: ${maxPct}% | Stop: ${stopPct}% | Take-profit: ${tpPct}%
+Min conviction to buy: ${minConviction}/10 | Trailing stops: ${trailingStop ? 'yes' : 'no'}
+${atMaxPositions ? 'AT MAX POSITIONS — only sell/trim actions allowed, no buys.' : ''}
+
+Return max 3 pipe-delimited action lines then SUMMARY|sentence:
+ACTION|TICKER|REASON(max 8 words)
+ACTION = buy/sell/trim/hold
+Rules: only buy if conviction >= ${minConviction} and cash > 15% and not at max positions
+Only sell if pnl < -${stopPct} OR pnl > ${tpPct}
+Trim (sell half) if position > ${maxPct * 2}% of portfolio
+If trailing stop enabled, sell positions up > ${tpPct * 0.7}% that start falling`;
+
+  try {
+    const res = await fetch('/api/coach', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: prompt }),
+    });
+    const data = await res.json();
+    const lines = (data.reply ?? '').trim().split('\n').filter(Boolean);
+
+    for (const line of lines) {
+      const parts = line.split('|');
+      if (parts.length < 2) continue;
+      const action = parts[0].toLowerCase().trim();
+      const ticker = parts[1].trim().toUpperCase();
+      const reason = (parts[2] ?? '').trim();
+
+      if (action === 'summary') { addLog(`📊 ${reason || ticker}`); continue; }
+
+      if (action === 'buy' && !atMaxPositions && current.cash > totalValue * 0.15) {
+        const budget = totalValue * maxPct / 100;
+        const existingPos = current.positions[ticker];
+        if (!existingPos) { addLog(`⏭ Skip BUY ${ticker} — no live price available`); continue; }
+        const price = existingPos.currentPrice;
+        const shares = Math.max(1, Math.floor(budget / price));
+        const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
+        const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
+        const ok = store.buy({ ticker, name: existingPos.name || ticker, price, exchange: 'AUTO', sector: existingPos.sector || 'Equity' }, shares, sl, tp, 'auto');
+        if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} @ $${fmt(price)} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
+      } else if ((action === 'sell' || action === 'trim') && current.positions[ticker]) {
+        const pos = current.positions[ticker];
+        const shares = action === 'trim' ? Math.max(1, Math.floor(pos.shares / 2)) : pos.shares;
+        store.sell(ticker, shares, pos.currentPrice, 'auto');
+        addLog(`🔴 ${action.toUpperCase()} ${shares}× ${ticker} — ${reason}`);
+        showToast(`🤖 Sold ${shares}× ${ticker}`, 'info');
+      }
+    }
+  } catch (e: any) {
+    addLog(`⚠️ Cycle error: ${e.message.slice(0, 50)}`);
+  }
+}
 
   try {
     const res = await fetch('/api/coach', {
@@ -540,12 +630,13 @@ ACTION = buy/sell/trim/hold. Only sell if pnl < -${stopPct} or > ${tpPct}. Only 
       if ((action === 'buy') && store.current().cash > totalValue * 0.15) {
         const budget = totalValue * maxPct / 100;
         const existingPos = store.current().positions[ticker];
-        const price = existingPos?.currentPrice ?? 100;
+        if (!existingPos) { addLog(`⏭ Skip BUY ${ticker} — no live price available`); continue; }
+        const price = existingPos.currentPrice;
         const shares = Math.max(1, Math.floor(budget / price));
         const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
         const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
-        const ok = store.buy({ ticker, name: ticker, price, exchange: 'AUTO', sector: 'Equity' }, shares, sl, tp, 'auto');
-        if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
+        const ok = store.buy({ ticker, name: existingPos.name || ticker, price, exchange: 'AUTO', sector: existingPos.sector || 'Equity' }, shares, sl, tp, 'auto');
+        if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} @ $${fmt(price)} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
       } else if ((action === 'sell' || action === 'trim') && store.current().positions[ticker]) {
         const pos = store.current().positions[ticker];
         const shares = action === 'trim' ? Math.max(1, Math.floor(pos.shares / 2)) : pos.shares;
@@ -560,7 +651,7 @@ ACTION = buy/sell/trim/hold. Only sell if pnl < -${stopPct} or > ${tpPct}. Only 
 }
 
 // ── Watchlist page ────────────────────────────────────────────────────────────
-function WatchlistPage({ showToast }: { showToast: (m: string, t?: any) => void }) {
+function WatchlistPage({ showToast, onViewDetail }: { showToast: (m: string, t?: any) => void; onViewDetail?: (stock: StockCard) => void }) {
   const { watchlist, addWatchlist, removeWatchlist } = useTraderStore();
   const store = useTraderStore();
   const current = store.current();
@@ -617,15 +708,32 @@ function WatchlistPage({ showToast }: { showToast: (m: string, t?: any) => void 
                     <div className="text-[10px] text-green-400/50 flex items-center gap-1 mb-2">
                       <span className="w-1.5 h-1.5 rounded-full bg-green-400" />{mkt.source?.replace(' (Live)','')}
                     </div>
-                    {/* FIX #12: Buy from watchlist */}
-                    <button onClick={() => {
-                      const shares = Math.max(1, Math.floor(current.cash * 0.05 / mkt.price));
-                      const ok = store.buy({ ticker: tk.replace('.AX','').replace('-USD',''), name: mkt.name || tk, price: mkt.price, exchange: mkt.exchange, sector: mkt.sector }, shares, null, null);
-                      if (ok) showToast(`Bought ${shares}× ${tk.replace('.AX','')}`);
-                      else showToast('Insufficient cash', 'err');
-                    }} className="w-full py-1.5 text-[11px] font-semibold bg-green-500 text-black rounded-lg hover:bg-green-400 transition-colors">
-                      Quick Buy 5%
-                    </button>
+                    <div className="flex gap-1.5">
+                      {/* FIX #12: Buy from watchlist */}
+                      <button onClick={() => {
+                        const shares = Math.max(1, Math.floor(current.cash * 0.05 / mkt.price));
+                        const ok = store.buy({ ticker: tk.replace('.AX','').replace('-USD',''), name: mkt.name || tk, price: mkt.price, exchange: mkt.exchange, sector: mkt.sector }, shares, null, null);
+                        if (ok) showToast(`Bought ${shares}× ${tk.replace('.AX','')}`);
+                        else showToast('Insufficient cash', 'err');
+                      }} className="flex-1 py-1.5 text-[11px] font-semibold bg-green-500 text-black rounded-lg hover:bg-green-400 transition-colors">
+                        Quick Buy
+                      </button>
+                      <button onClick={() => onViewDetail && onViewDetail({
+                        ticker: tk.replace('.AX','').replace('-USD',''), apiTicker: tk,
+                        name: mkt.name || tk, price: mkt.price, change1d: mkt.change1d,
+                        change52w: mkt.change52w ?? 0, marketCap: mkt.marketCap ?? 'N/A',
+                        currency: mkt.currency ?? 'USD', exchange: mkt.exchange ?? 'NYSE',
+                        sector: mkt.sector ?? 'Equity', source: mkt.source ?? '',
+                        history: mkt.history ?? [], high52w: mkt.high52w ?? 0,
+                        low52w: mkt.low52w ?? 0, volume: mkt.volume ?? 0,
+                        conviction: 6, upside: 15, recommendation: 'Hold', riskLevel: 'Medium',
+                        rsiEstimate: 50, macdSignal: 'Neutral', trend: 'Sideways', candleSignal: 'None',
+                        entryPrice: mkt.price, stopLoss: mkt.price * 0.92, targetPrice: mkt.price * 1.2,
+                        thesis: '', risks: '', catalysts: [],
+                      })} className="flex-1 py-1.5 text-[11px] font-medium bg-white/5 text-white/50 border border-white/10 rounded-lg hover:border-white/25 transition-colors">
+                        Detail ↗
+                      </button>
+                    </div>
                   </>
                 ) : (
                   <div className="text-xs text-white/25">Price unavailable</div>
@@ -633,6 +741,200 @@ function WatchlistPage({ showToast }: { showToast: (m: string, t?: any) => void 
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Market Hours Clock ────────────────────────────────────────────────────────
+const EXCHANGES = [
+  { name: 'ASX',     tz: 'Australia/Sydney',    open: '10:00', close: '16:00', flag: '🇦🇺', days: [1,2,3,4,5] },
+  { name: 'NYSE',    tz: 'America/New_York',     open: '09:30', close: '16:00', flag: '🇺🇸', days: [1,2,3,4,5] },
+  { name: 'NASDAQ',  tz: 'America/New_York',     open: '09:30', close: '16:00', flag: '🇺🇸', days: [1,2,3,4,5] },
+  { name: 'LSE',     tz: 'Europe/London',        open: '08:00', close: '16:30', flag: '🇬🇧', days: [1,2,3,4,5] },
+  { name: 'TSE',     tz: 'Asia/Tokyo',           open: '09:00', close: '15:30', flag: '🇯🇵', days: [1,2,3,4,5] },
+  { name: 'Crypto',  tz: 'UTC',                  open: '00:00', close: '23:59', flag: '₿',   days: [0,1,2,3,4,5,6] },
+];
+
+function isMarketOpen(tz: string, open: string, close: string, days: number[]): boolean {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+  const day = now.getDay();
+  if (!days.includes(day)) return false;
+  const h = now.getHours(), m = now.getMinutes();
+  const cur = h * 60 + m;
+  const [oh, om] = open.split(':').map(Number);
+  const [ch, cm] = close.split(':').map(Number);
+  return cur >= oh * 60 + om && cur < ch * 60 + cm;
+}
+
+function getLocalTime(tz: string): string {
+  return new Date().toLocaleTimeString('en-AU', { timeZone: tz, hour: '2-digit', minute: '2-digit' });
+}
+
+function MarketClock() {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick(v => v + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  return (
+    <div className="bg-[#13131f] border border-white/5 rounded-xl p-4">
+      <div className="text-[10px] text-white/25 uppercase tracking-wide mb-3">Market Hours</div>
+      <div className="space-y-2">
+        {EXCHANGES.map(ex => {
+          const open = isMarketOpen(ex.tz, ex.open, ex.close, ex.days);
+          const localTime = getLocalTime(ex.tz);
+          return (
+            <div key={ex.name} className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-base leading-none">{ex.flag}</span>
+                <div>
+                  <div className="text-xs font-medium text-white/70">{ex.name}</div>
+                  <div className="text-[10px] text-white/30">{localTime} local</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className={`w-1.5 h-1.5 rounded-full ${open ? 'bg-green-400 animate-pulse' : 'bg-white/20'}`} />
+                <span className={`text-[11px] font-semibold ${open ? 'text-green-400' : 'text-white/30'}`}>
+                  {open ? 'OPEN' : 'CLOSED'}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-3 pt-3 border-t border-white/5 text-[10px] text-white/25">
+        Your time: {new Date().toLocaleTimeString('en-AU', {hour:'2-digit',minute:'2-digit'})} · Updates every minute
+      </div>
+    </div>
+  );
+}
+
+// ── Sentiment Panel ───────────────────────────────────────────────────────────
+function SentimentPanel({ ticker, name, price }: { ticker: string; name: string; price: number }) {
+  const [sentiment, setSentiment] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch(`/api/news?ticker=${ticker}&name=${encodeURIComponent(name)}&price=${price}`)
+      .then(r => r.json())
+      .then(setSentiment)
+      .catch(() => setSentiment(null))
+      .finally(() => setLoading(false));
+  }, [ticker]);
+
+  if (loading) return (
+    <div className="space-y-2">
+      {[1,2,3].map(i => <div key={i} className="h-8 bg-white/5 rounded-lg animate-pulse" />)}
+    </div>
+  );
+
+  if (!sentiment) return <div className="text-xs text-white/30">Sentiment data unavailable</div>;
+
+  const scoreColor = sentiment.sentimentScore > 20 ? '#00d48a' : sentiment.sentimentScore < -20 ? '#ff3d5a' : '#f59e0b';
+  const sentEmoji = { Bullish:'🐂', Bearish:'🐻', Neutral:'😐', Mixed:'🤔' }[sentiment.overallSentiment as string] ?? '😐';
+
+  return (
+    <div className="space-y-4">
+      {/* Overall sentiment */}
+      <div className="flex items-center gap-4">
+        <div className="text-center">
+          <div className="text-3xl mb-1">{sentEmoji}</div>
+          <div className="text-xs font-semibold" style={{color: scoreColor}}>{sentiment.overallSentiment}</div>
+        </div>
+        <div className="flex-1">
+          <div className="flex justify-between text-[10px] mb-1">
+            <span className="text-white/30">Sentiment Score</span>
+            <span className="font-mono" style={{color: scoreColor}}>{sentiment.sentimentScore > 0 ? '+' : ''}{sentiment.sentimentScore}</span>
+          </div>
+          <div className="h-2 bg-[#1f1f2e] rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all" style={{
+              width: `${Math.abs(sentiment.sentimentScore)}%`,
+              marginLeft: sentiment.sentimentScore < 0 ? `${100 - Math.abs(sentiment.sentimentScore)}%` : '0',
+              background: scoreColor,
+            }} />
+          </div>
+          <div className="text-[10px] text-white/40 mt-1.5 leading-relaxed">{sentiment.summary}</div>
+        </div>
+      </div>
+
+      {/* Key stats row */}
+      <div className="grid grid-cols-3 gap-2">
+        {[
+          ['Reddit', sentiment.redditMood],
+          ['Analysts', sentiment.analystConsensus],
+          ['Median Target', `$${sentiment.priceTargets?.median?.toFixed(0) ?? '?'}`],
+        ].map(([l, v]) => (
+          <div key={l} className="bg-[#1f1f2e] rounded-lg p-2 text-center">
+            <div className="text-[9px] text-white/25 uppercase mb-0.5">{l}</div>
+            <div className="text-xs font-medium text-white/70">{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Price targets */}
+      {sentiment.priceTargets && (
+        <div>
+          <div className="text-[10px] text-white/25 uppercase tracking-wide mb-2">Analyst Price Targets</div>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-red-400 font-mono">${sentiment.priceTargets.low?.toFixed(0)}</span>
+            <div className="flex-1 h-1.5 bg-[#1f1f2e] rounded-full relative">
+              <div className="absolute h-full rounded-full bg-gradient-to-r from-red-500 via-amber-500 to-green-500" style={{width:'100%'}} />
+              <div className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-white border-2 border-[#13131f]"
+                style={{left: `${Math.min(90, Math.max(5, ((price - sentiment.priceTargets.low) / (sentiment.priceTargets.high - sentiment.priceTargets.low)) * 100))}%`}} />
+            </div>
+            <span className="text-[10px] text-green-400 font-mono">${sentiment.priceTargets.high?.toFixed(0)}</span>
+          </div>
+          <div className="text-center text-[10px] text-white/30 mt-1">Current: ${price.toFixed(2)} · Median: ${sentiment.priceTargets.median?.toFixed(0)}</div>
+        </div>
+      )}
+
+      {/* Key points */}
+      {sentiment.keyPoints?.length > 0 && (
+        <div>
+          <div className="text-[10px] text-white/25 uppercase tracking-wide mb-2">Market Insights</div>
+          {sentiment.keyPoints.map((pt: string, i: number) => (
+            <div key={i} className="flex gap-2 text-xs text-white/50 mb-1.5">
+              <span className="text-white/25 shrink-0">•</span><span>{pt}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Catalysts & Risks */}
+      <div className="grid grid-cols-2 gap-3">
+        {sentiment.catalysts?.length > 0 && (
+          <div>
+            <div className="text-[10px] text-green-400/60 uppercase tracking-wide mb-1.5">⚡ Catalysts</div>
+            {sentiment.catalysts.map((c: string, i: number) => (
+              <div key={i} className="text-[11px] text-white/50 mb-1">{c}</div>
+            ))}
+          </div>
+        )}
+        {sentiment.risks?.length > 0 && (
+          <div>
+            <div className="text-[10px] text-red-400/60 uppercase tracking-wide mb-1.5">⚠ Risks</div>
+            {sentiment.risks.map((r: string, i: number) => (
+              <div key={i} className="text-[11px] text-white/50 mb-1">{r}</div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* News headlines */}
+      {sentiment.news?.length > 0 && (
+        <div>
+          <div className="text-[10px] text-white/25 uppercase tracking-wide mb-2">Recent Headlines</div>
+          {sentiment.news.slice(0, 5).map((n: any, i: number) => (
+            <a key={i} href={n.url} target="_blank" rel="noopener noreferrer"
+              className="block py-2 border-b border-white/5 last:border-0 hover:bg-white/2 transition-colors">
+              <div className="text-[11px] text-white/60 leading-relaxed mb-0.5 line-clamp-2">{n.title}</div>
+              <div className="text-[10px] text-white/25">{n.source} · {n.publishedAt ? new Date(n.publishedAt).toLocaleDateString() : ''}</div>
+            </a>
+          ))}
         </div>
       )}
     </div>
@@ -659,9 +961,36 @@ function AppInner() {
   const [apMax, setApMax] = useState(5);
   const [apStop, setApStop] = useState(7);
   const [apTp, setApTp] = useState(15);
+  // Additional strategy settings
+  const [apMinConviction, setApMinConviction] = useState(6);   // min signal conviction to buy
+  const [apMaxPositions, setApMaxPositions] = useState(8);     // max concurrent positions
+  const [apTrailingStop, setApTrailingStop] = useState(false); // trail stop up as price rises
+  const [apSectors, setApSectors] = useState<string[]>([]);    // sector focus (empty = all)
+
+  // Risk profile presets — auto-fills all sliders
+  const RISK_PRESETS: Record<string, {max:number;stop:number;tp:number;conv:number;maxPos:number}> = {
+    conservative: { max: 3,  stop: 5,  tp: 10, conv: 8, maxPos: 5  },
+    moderate:     { max: 5,  stop: 7,  tp: 15, conv: 6, maxPos: 8  },
+    aggressive:   { max: 10, stop: 12, tp: 30, conv: 5, maxPos: 12 },
+    scalping:     { max: 2,  stop: 3,  tp: 6,  conv: 7, maxPos: 10 },
+    momentum:     { max: 8,  stop: 10, tp: 25, conv: 6, maxPos: 6  },
+  };
+
+  const applyRiskPreset = (profile: string) => {
+    const p = RISK_PRESETS[profile];
+    if (!p) return;
+    setApRisk(profile);
+    setApMax(p.max);
+    setApStop(p.stop);
+    setApTp(p.tp);
+    setApMinConviction(p.conv);
+    setApMaxPositions(p.maxPos);
+  };
   const [histFilter, setHistFilter] = useState<'all'|'buy'|'sell'|'auto'>('all'); // FIX #15
   const [toast, setToast] = useState<{msg:string;type:'ok'|'err'|'info'}|null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false); // FIX #13 mobile
+  const [clockTick, setClockTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setClockTick(v => v+1), 60000); return () => clearInterval(t); }, []);
   const apIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const store = useTraderStore();
@@ -722,7 +1051,7 @@ function AppInner() {
       const cycle = () => runAutopilotCycle(
         store, apRisk, apMax, apStop, apTp, totalValue,
         (msg) => setApLog(l => [{ ts: Date.now(), msg }, ...l].slice(0, 60)),
-        showToast
+        showToast, apMinConviction, apMaxPositions, apTrailingStop
       );
       cycle(); // run immediately with new settings
       apIntervalRef.current = setInterval(cycle, 30000);
@@ -730,7 +1059,7 @@ function AppInner() {
       if (apIntervalRef.current) { clearInterval(apIntervalRef.current); apIntervalRef.current = null; }
     }
     return () => { if (apIntervalRef.current) clearInterval(apIntervalRef.current); };
-  }, [apOn, apRisk, apMax, apStop, apTp]); // re-run whenever any setting changes
+  }, [apOn, apRisk, apMax, apStop, apTp, apMinConviction, apMaxPositions, apTrailingStop]); // re-run whenever any setting changes
 
   // ── Screener ────────────────────────────────────────────────────────────
   const runScreener = async () => {
@@ -953,6 +1282,25 @@ function AppInner() {
             className="mt-3 w-full py-1.5 text-[11px] text-white/35 bg-white/5 border border-white/10 rounded-lg hover:border-white/25 transition-colors">
             Reset Portfolio
           </button>
+          {/* Mini market status */}
+          <div className="mt-3 space-y-1.5 pt-3 border-t border-white/5">
+            {([
+              {name:'ASX',tz:'Australia/Sydney',open:'10:00',close:'16:00',days:[1,2,3,4,5]},
+              {name:'NYSE/NASDAQ',tz:'America/New_York',open:'09:30',close:'16:00',days:[1,2,3,4,5]},
+              {name:'Crypto',tz:'UTC',open:'00:00',close:'23:59',days:[0,1,2,3,4,5,6]},
+            ] as const).map(ex => {
+              const open = isMarketOpen(ex.tz, ex.open, ex.close, [...ex.days]);
+              return (
+                <div key={ex.name} className="flex items-center justify-between">
+                  <span className="text-[10px] text-white/30">{ex.name}</span>
+                  <div className="flex items-center gap-1">
+                    <div className={`w-1.5 h-1.5 rounded-full ${open ? 'bg-green-400 animate-pulse' : 'bg-white/15'}`} />
+                    <span className={`text-[9px] font-semibold ${open ? 'text-green-400' : 'text-white/20'}`}>{open ? 'OPEN' : 'CLOSED'}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       </aside>
 
@@ -1106,6 +1454,25 @@ function AppInner() {
               )}
 
               {/* Positions table */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+                <MarketClock />
+                <div className="lg:col-span-2 bg-[#13131f] border border-white/5 rounded-xl p-4">
+                  <div className="text-[10px] text-white/25 uppercase tracking-wide mb-2">Portfolio Stats</div>
+                  <div className="grid grid-cols-3 gap-3">
+                    {[
+                      ['Positions', Object.keys(current.positions).length],
+                      ['Win Rate', (() => { const sells = current.transactions.filter(t=>t.type==='sell'&&t.source==='manual'); const wins = sells.filter(s=>{ const b=current.transactions.find(t=>t.type==='buy'&&t.ticker===s.ticker); return b&&s.price>b.price; }); return sells.length ? Math.round(wins.length/sells.length*100)+'%' : 'N/A'; })()],
+                      ['Trades', current.transactions.length],
+                    ].map(([l,v]) => (
+                      <div key={String(l)} className="text-center">
+                        <div className="text-[10px] text-white/25 mb-1">{String(l)}</div>
+                        <div className="font-mono text-lg text-white/80">{String(v)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
               {Object.keys(current.positions).length > 0 ? (
                 <div className="bg-[#13131f] border border-white/5 rounded-xl overflow-hidden">
                   <div className="px-4 py-3 border-b border-white/5 text-[10px] text-white/25 uppercase tracking-wide">Open Positions</div>
@@ -1123,7 +1490,11 @@ function AppInner() {
                           const portPct = pos.shares * pos.currentPrice / totalValue * 100;
                           const isUp = posPnl >= 0;
                           return (
-                            <tr key={tk} className="border-t border-white/5 hover:bg-white/[0.02] transition-colors">
+                            <tr key={tk} className="border-t border-white/5 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                              onClick={() => {
+                                const s = stocks.find(s => s.ticker === tk) ?? null;
+                                if (s) setOrderStock(s);
+                              }}>
                               <td className="px-3 py-3"><span className="font-mono text-xs bg-[#1f1f2e] border border-white/10 rounded px-2 py-0.5">{tk}</span></td>
                               <td className="px-3 py-3 text-xs text-white/45 max-w-[100px] truncate">{pos.name}</td>
                               <td className="px-3 py-3 font-mono text-xs">{pos.shares}</td>
@@ -1184,26 +1555,87 @@ function AppInner() {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-                <div className="bg-[#13131f] border border-white/5 rounded-xl p-4">
-                  <div className="text-[10px] text-white/25 uppercase tracking-wide mb-4">Strategy Settings</div>
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-[10px] text-white/30 uppercase tracking-wider mb-1.5">Risk Profile</label>
-                      <select value={apRisk} onChange={e => setApRisk(e.target.value)}
-                        className="w-full bg-[#1f1f2e] border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-green-500/50">
-                        <option value="conservative">Conservative</option>
-                        <option value="moderate">Moderate</option>
-                        <option value="aggressive">Aggressive</option>
-                      </select>
+                <div className="bg-[#13131f] border border-white/5 rounded-xl p-4 space-y-4">
+                  {/* Risk Profile Presets */}
+                  <div>
+                    <div className="text-[10px] text-white/25 uppercase tracking-wide mb-3">Risk Profile</div>
+                    <div className="grid grid-cols-2 gap-1.5 mb-2">
+                      {Object.entries({conservative:'🛡 Conservative',moderate:'⚖ Moderate',aggressive:'🔥 Aggressive',scalping:'⚡ Scalping',momentum:'🚀 Momentum'}).map(([k, label]) => (
+                        <button key={k} onClick={() => applyRiskPreset(k)}
+                          className={`py-2 px-3 rounded-lg text-xs font-medium transition-all border ${
+                            apRisk === k
+                              ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+                              : 'bg-[#1f1f2e] text-white/40 border-white/8 hover:border-white/20 hover:text-white/70'
+                          }`}>
+                          {label}
+                        </button>
+                      ))}
                     </div>
-                    {[['Max % per trade', apMax, setApMax, 1, 20, 1], ['Auto Stop Loss %', apStop, setApStop, 1, 25, 0.5], ['Auto Take Profit %', apTp, setApTp, 2, 100, 1]].map(([label, val, setter, min, max, step]) => (
-                      <div key={String(label)}>
-                        <label className="block text-[10px] text-white/30 uppercase tracking-wider mb-1.5">{String(label)}: <span className="text-white/60 font-mono">{String(val)}%</span></label>
+                    <div className="text-[10px] text-white/25 leading-relaxed">
+                      {{conservative:'Small positions, tight stops, only high-conviction buys. Preserves capital.',
+                        moderate:'Balanced approach. Good for most traders.',
+                        aggressive:'Larger positions, wider stops, more trades. Higher risk/reward.',
+                        scalping:'Many small quick trades with tight stops.',
+                        momentum:'Rides strong trends with trailing stops.'}[apRisk] ?? ''}
+                    </div>
+                  </div>
+
+                  {/* Position Sizing */}
+                  <div>
+                    <div className="text-[10px] text-white/25 uppercase tracking-wide mb-3">Position Sizing</div>
+                    {([
+                      ['Max % per trade', apMax, setApMax, 1, 20, 1, '%'],
+                      ['Max open positions', apMaxPositions, setApMaxPositions, 2, 20, 1, ''],
+                    ] as const).map(([label, val, setter, min, max, step, unit]) => (
+                      <div key={label} className="mb-3">
+                        <div className="flex justify-between mb-1">
+                          <label className="text-[10px] text-white/30 uppercase tracking-wider">{label}</label>
+                          <span className="text-[10px] font-mono text-white/60">{val}{unit}</span>
+                        </div>
                         <input type="range" value={Number(val)} onChange={e => (setter as any)(parseFloat(e.target.value))}
-                          min={Number(min)} max={Number(max)} step={Number(step)}
-                          className="w-full accent-green-500" />
+                          min={Number(min)} max={Number(max)} step={Number(step)} className="w-full accent-green-500" />
                       </div>
                     ))}
+                  </div>
+
+                  {/* Risk Management */}
+                  <div>
+                    <div className="text-[10px] text-white/25 uppercase tracking-wide mb-3">Risk Management</div>
+                    {([
+                      ['Auto Stop Loss %', apStop, setApStop, 1, 25, 0.5, '%'],
+                      ['Auto Take Profit %', apTp, setApTp, 2, 100, 1, '%'],
+                      ['Min Conviction Score', apMinConviction, setApMinConviction, 1, 10, 1, '/10'],
+                    ] as const).map(([label, val, setter, min, max, step, unit]) => (
+                      <div key={label} className="mb-3">
+                        <div className="flex justify-between mb-1">
+                          <label className="text-[10px] text-white/30 uppercase tracking-wider">{label}</label>
+                          <span className="text-[10px] font-mono text-white/60">{val}{unit}</span>
+                        </div>
+                        <input type="range" value={Number(val)} onChange={e => (setter as any)(parseFloat(e.target.value))}
+                          min={Number(min)} max={Number(max)} step={Number(step)} className="w-full accent-green-500" />
+                      </div>
+                    ))}
+                    <div className="flex items-center justify-between mt-3 py-2.5 px-3 bg-[#1f1f2e] rounded-lg">
+                      <div>
+                        <div className="text-[11px] text-white/60 font-medium">Trailing Stop Loss</div>
+                        <div className="text-[10px] text-white/25">Moves stop up as price rises, locking in gains</div>
+                      </div>
+                      <button onClick={() => setApTrailingStop(v => !v)}
+                        className={`w-10 h-5 rounded-full transition-all relative ${apTrailingStop ? 'bg-green-500' : 'bg-white/10'}`}>
+                        <div className={`w-4 h-4 rounded-full bg-white absolute top-0.5 transition-all ${apTrailingStop ? 'right-0.5' : 'left-0.5'}`} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Current settings summary */}
+                  <div className="bg-[#1a1a2a] rounded-lg p-3 text-[10px] text-white/30 space-y-1">
+                    <div className="text-white/50 font-semibold mb-1.5">Active Settings</div>
+                    <div className="flex justify-between"><span>Buy when conviction ≥</span><span className="text-white/60 font-mono">{apMinConviction}/10</span></div>
+                    <div className="flex justify-between"><span>Max portfolio per trade</span><span className="text-white/60 font-mono">{apMax}%</span></div>
+                    <div className="flex justify-between"><span>Stop loss at</span><span className="text-red-400/70 font-mono">-{apStop}%</span></div>
+                    <div className="flex justify-between"><span>Take profit at</span><span className="text-green-400/70 font-mono">+{apTp}%</span></div>
+                    <div className="flex justify-between"><span>Max open positions</span><span className="text-white/60 font-mono">{apMaxPositions}</span></div>
+                    <div className="flex justify-between"><span>Trailing stop</span><span className={apTrailingStop ? 'text-green-400/70' : 'text-white/40'}>{apTrailingStop ? 'ON' : 'OFF'}</span></div>
                   </div>
                 </div>
 
@@ -1212,7 +1644,7 @@ function AppInner() {
                   {apLog.length === 0 ? (
                     <div className="text-center py-8 text-white/25 text-sm">Enable autopilot to start logging activity</div>
                   ) : (
-                    <div className="space-y-0">
+                    <div className="space-y-0 max-h-96 overflow-y-auto">
                       {apLog.map((l, i) => (
                         <div key={i} className="flex justify-between py-2 border-b border-white/5 last:border-0 text-xs">
                           <span className="text-white/55">{l.msg}</span>
@@ -1270,7 +1702,7 @@ function AppInner() {
           )}
 
           {/* ── WATCHLIST ── */}
-          {page === 'watchlist' && <WatchlistPage showToast={showToast} />}
+          {page === 'watchlist' && <WatchlistPage showToast={showToast} onViewDetail={(stock) => setOrderStock(stock)} />}
 
           {/* ── COACH ── */}
           {page === 'coach' && (
