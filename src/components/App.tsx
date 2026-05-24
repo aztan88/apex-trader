@@ -612,43 +612,6 @@ If trailing stop enabled, sell positions up > ${tpPct * 0.7}% that start falling
   }
 }
 
-  try {
-    const res = await fetch('/api/coach', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: prompt }),
-    });
-    const data = await res.json();
-    const lines = (data.reply ?? '').trim().split('\n').filter(Boolean);
-    for (const line of lines) {
-      const parts = line.split('|');
-      if (parts.length < 2) continue;
-      const action = parts[0].toLowerCase().trim();
-      const ticker = parts[1].trim().toUpperCase();
-      const reason = (parts[2] ?? '').trim();
-      if (action === 'summary') { addLog(`📊 ${reason || ticker}`); continue; }
-      if ((action === 'buy') && store.current().cash > totalValue * 0.15) {
-        const budget = totalValue * maxPct / 100;
-        const existingPos = store.current().positions[ticker];
-        if (!existingPos) { addLog(`⏭ Skip BUY ${ticker} — no live price available`); continue; }
-        const price = existingPos.currentPrice;
-        const shares = Math.max(1, Math.floor(budget / price));
-        const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
-        const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
-        const ok = store.buy({ ticker, name: existingPos.name || ticker, price, exchange: 'AUTO', sector: existingPos.sector || 'Equity' }, shares, sl, tp, 'auto');
-        if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} @ $${fmt(price)} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
-      } else if ((action === 'sell' || action === 'trim') && store.current().positions[ticker]) {
-        const pos = store.current().positions[ticker];
-        const shares = action === 'trim' ? Math.max(1, Math.floor(pos.shares / 2)) : pos.shares;
-        store.sell(ticker, shares, pos.currentPrice, 'auto');
-        addLog(`🔴 ${action.toUpperCase()} ${shares}× ${ticker} — ${reason}`);
-        showToast(`🤖 Sold ${shares}× ${ticker}`, 'info');
-      }
-    }
-  } catch (e: any) {
-    addLog(`⚠️ Cycle error: ${e.message.slice(0, 50)}`);
-  }
-}
 
 // ── Watchlist page ────────────────────────────────────────────────────────────
 function WatchlistPage({ showToast, onViewDetail }: { showToast: (m: string, t?: any) => void; onViewDetail?: (stock: StockCard) => void }) {
