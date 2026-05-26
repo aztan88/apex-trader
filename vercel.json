@@ -2,12 +2,13 @@
   "buildCommand": "npm run build",
   "framework": "nextjs",
   "functions": {
-    "src/app/api/prices/route.ts":   { "maxDuration": 45 },
-    "src/app/api/signals/route.ts":  { "maxDuration": 30 },
-    "src/app/api/analysis/route.ts": { "maxDuration": 30 },
-    "src/app/api/coach/route.ts":    { "maxDuration": 30 },
-    "src/app/api/search/route.ts":   { "maxDuration": 30 },
-    "src/app/api/news/route.ts":     { "maxDuration": 30 },
-    "src/app/api/health/route.ts":   { "maxDuration": 30 }
+    "src/app/api/prices/route.ts":      { "maxDuration": 45 },
+    "src/app/api/signals/route.ts":     { "maxDuration": 30 },
+    "src/app/api/analysis/route.ts":    { "maxDuration": 30 },
+    "src/app/api/coach/route.ts":       { "maxDuration": 30 },
+    "src/app/api/search/route.ts":      { "maxDuration": 30 },
+    "src/app/api/news/route.ts":        { "maxDuration": 30 },
+    "src/app/api/autopilot/route.ts":   { "maxDuration": 45 },
+    "src/app/api/health/route.ts":      { "maxDuration": 30 }
   }
 }

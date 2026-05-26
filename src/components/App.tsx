@@ -533,7 +533,7 @@ function PortfolioChart({ history }: { history: {ts:number;value:number}[] }) {
   return <div className="h-40 relative"><canvas ref={canvasRef} /></div>;
 }
 
-// ── Autopilot cycle (FIX #18: fully wired) ───────────────────────────────────
+// ── Autopilot cycle — quant-style discovery + execution ──────────────────────
 async function runAutopilotCycle(
   store: { current: () => { cash: number; positions: Record<string, any> }; buy: (...a: any[]) => boolean; sell: (...a: any[]) => boolean },
   risk: string, maxPct: number, stopPct: number, tpPct: number,
@@ -542,73 +542,159 @@ async function runAutopilotCycle(
 ) {
   const current = store.current();
   const positions = current.positions;
-  const keys = Object.keys(positions);
+  const posKeys = Object.keys(positions);
+  const atMaxPositions = posKeys.length >= maxPositions;
 
-  // Don't buy if already at max positions
-  const atMaxPositions = keys.length >= maxPositions;
+  addLog('🔍 Scanning market for opportunities…');
 
-  const posStr = keys.length
-    ? keys.map(k => {
-        const p = positions[k];
-        const pnlPct = (p.currentPrice - p.avgPrice) / p.avgPrice * 100;
-        // Trailing stop: if enabled and stock is up, note that stop should trail
-        const trailNote = trailingStop && pnlPct > 5 ? '(trail)' : '';
-        return `${k}:pnl${pnlPct.toFixed(1)}%${trailNote}`;
-      }).join(',')
-    : 'none';
+  // ── PHASE 1: Manage existing positions ────────────────────────────────────
+  const trimmed: string[] = [];
+  const sold: string[] = [];
 
-  const prompt = `Portfolio: cash $${current.cash.toFixed(0)} of $${totalValue.toFixed(0)} total
-Positions (${keys.length}/${maxPositions} max): ${posStr}
-Risk: ${risk} | Max per trade: ${maxPct}% | Stop: ${stopPct}% | Take-profit: ${tpPct}%
-Min conviction to buy: ${minConviction}/10 | Trailing stops: ${trailingStop ? 'yes' : 'no'}
-${atMaxPositions ? 'AT MAX POSITIONS — only sell/trim actions allowed, no buys.' : ''}
+  for (const [ticker, pos] of Object.entries(positions)) {
+    const pnlPct = (pos.currentPrice - pos.avgPrice) / pos.avgPrice * 100;
+    const positionPct = (pos.shares * pos.currentPrice) / totalValue * 100;
 
-Return max 3 pipe-delimited action lines then SUMMARY|sentence:
-ACTION|TICKER|REASON(max 8 words)
-ACTION = buy/sell/trim/hold
-Rules: only buy if conviction >= ${minConviction} and cash > 15% and not at max positions
-Only sell if pnl < -${stopPct} OR pnl > ${tpPct}
-Trim (sell half) if position > ${maxPct * 2}% of portfolio
-If trailing stop enabled, sell positions up > ${tpPct * 0.7}% that start falling`;
+    // Hard stop loss
+    if (pnlPct <= -stopPct) {
+      store.sell(ticker, pos.shares, pos.currentPrice, 'auto');
+      addLog(`🛑 STOP LOSS ${ticker} @ $${pos.currentPrice.toFixed(2)} (${pnlPct.toFixed(1)}%)`);
+      showToast(`🛑 Stop loss hit: ${ticker}`, 'err');
+      sold.push(ticker);
+      continue;
+    }
 
-  try {
-    const res = await fetch('/api/coach', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: prompt }),
-    });
-    const data = await res.json();
-    const lines = (data.reply ?? '').trim().split('\n').filter(Boolean);
+    // Take profit
+    if (pnlPct >= tpPct) {
+      store.sell(ticker, pos.shares, pos.currentPrice, 'auto');
+      addLog(`🎯 TAKE PROFIT ${ticker} @ $${pos.currentPrice.toFixed(2)} (+${pnlPct.toFixed(1)}%)`);
+      showToast(`🎯 Take profit: ${ticker} +${pnlPct.toFixed(1)}%`, 'ok');
+      sold.push(ticker);
+      continue;
+    }
 
-    for (const line of lines) {
-      const parts = line.split('|');
-      if (parts.length < 2) continue;
-      const action = parts[0].toLowerCase().trim();
-      const ticker = parts[1].trim().toUpperCase();
-      const reason = (parts[2] ?? '').trim();
-
-      if (action === 'summary') { addLog(`📊 ${reason || ticker}`); continue; }
-
-      if (action === 'buy' && !atMaxPositions && current.cash > totalValue * 0.15) {
-        const budget = totalValue * maxPct / 100;
-        const existingPos = current.positions[ticker];
-        if (!existingPos) { addLog(`⏭ Skip BUY ${ticker} — no live price available`); continue; }
-        const price = existingPos.currentPrice;
-        const shares = Math.max(1, Math.floor(budget / price));
-        const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
-        const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
-        const ok = store.buy({ ticker, name: existingPos.name || ticker, price, exchange: 'AUTO', sector: existingPos.sector || 'Equity' }, shares, sl, tp, 'auto');
-        if (ok) { addLog(`🟢 BUY ${shares}× ${ticker} @ $${fmt(price)} — ${reason}`); showToast(`🤖 Bought ${shares}× ${ticker}`, 'info'); }
-      } else if ((action === 'sell' || action === 'trim') && current.positions[ticker]) {
-        const pos = current.positions[ticker];
-        const shares = action === 'trim' ? Math.max(1, Math.floor(pos.shares / 2)) : pos.shares;
-        store.sell(ticker, shares, pos.currentPrice, 'auto');
-        addLog(`🔴 ${action.toUpperCase()} ${shares}× ${ticker} — ${reason}`);
-        showToast(`🤖 Sold ${shares}× ${ticker}`, 'info');
+    // Trailing stop: if up more than 60% of TP target and falling
+    if (trailingStop && pnlPct >= tpPct * 0.6 && pnlPct < pnlPct * 0.9) {
+      const newStop = pos.avgPrice * (1 + (pnlPct * 0.5) / 100);
+      if (pos.currentPrice <= newStop) {
+        store.sell(ticker, pos.shares, pos.currentPrice, 'auto');
+        addLog(`📉 TRAILING STOP ${ticker} @ $${pos.currentPrice.toFixed(2)} (locked ${(pnlPct*0.5).toFixed(1)}%)`);
+        sold.push(ticker);
+        continue;
       }
     }
+
+    // Trim oversized positions (> 2× max per trade)
+    if (positionPct > maxPct * 2 && !trimmed.includes(ticker)) {
+      const trimShares = Math.floor(pos.shares * 0.33); // sell 1/3
+      if (trimShares > 0) {
+        store.sell(ticker, trimShares, pos.currentPrice, 'auto');
+        addLog(`✂️ TRIM ${ticker} (${positionPct.toFixed(1)}% of portfolio → rebalancing)`);
+        trimmed.push(ticker);
+      }
+    }
+  }
+
+  // ── PHASE 2: Discover new opportunities (if cash available & slots open) ──
+  const updatedCash = store.current().cash;
+  const updatedPositions = store.current().positions;
+  const updatedKeys = Object.keys(updatedPositions);
+  const hasCapacity = updatedKeys.length < maxPositions && updatedCash > totalValue * 0.1;
+
+  if (!hasCapacity) {
+    addLog(`💼 ${updatedKeys.length}/${maxPositions} positions, $${updatedCash.toFixed(0)} cash — holding`);
+    return;
+  }
+
+  addLog(`🧠 Running quant scan (${risk} profile, conviction ≥${minConviction})…`);
+
+  try {
+    const discoverRes = await fetch('/api/autopilot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        risk, minConviction, cash: updatedCash, totalValue,
+        existingTickers: updatedKeys,
+        sectors: [],
+        forceRefresh: sold.length > 0 || trimmed.length > 0, // refresh if we just sold
+      }),
+    });
+
+    if (!discoverRes.ok) { addLog('⚠ Discovery service unavailable'); return; }
+    const { discoveries, cached, cacheAge } = await discoverRes.json();
+
+    if (!discoveries?.length) { addLog('⚠ No discoveries returned'); return; }
+
+    const source = cached ? `cached ${cacheAge}` : 'fresh scan';
+    addLog(`📋 ${discoveries.length} candidates found (${source})`);
+
+    // Filter by conviction and not already holding
+    const candidates = (discoveries as any[])
+      .filter(d => d.conviction >= minConviction && !updatedKeys.includes(d.ticker))
+      .sort((a, b) => b.conviction - a.conviction);
+
+    if (candidates.length === 0) {
+      addLog(`No candidates meet conviction ≥${minConviction} threshold`);
+      return;
+    }
+
+    // ── PHASE 3: Fetch real prices and execute best opportunities ────────────
+    const slotsAvailable = maxPositions - updatedKeys.length;
+    const toEvaluate = candidates.slice(0, Math.min(slotsAvailable + 2, 4)); // evaluate top 4
+
+    addLog(`💰 Evaluating ${toEvaluate.length} candidates with live prices…`);
+
+    // Fetch prices in parallel
+    const tickerList = toEvaluate.map((d: any) => d.ticker).join(',');
+    const priceRes = await fetch(`/api/prices?tickers=${encodeURIComponent(tickerList)}`);
+    if (!priceRes.ok) { addLog('⚠ Price fetch failed'); return; }
+    const priceMap = await priceRes.json();
+
+    let bought = 0;
+    for (const candidate of toEvaluate) {
+      if (bought >= slotsAvailable) break;
+      if (store.current().cash < totalValue * 0.05) break; // under 5% cash, stop
+
+      const mkt = priceMap[candidate.ticker] ?? priceMap[candidate.ticker.replace('.AX','').replace('-USD','')];
+      if (!mkt || mkt.error || !mkt.price || mkt.price <= 0) {
+        addLog(`⏭ Skip ${candidate.ticker} — no price data`);
+        continue;
+      }
+
+      const price = mkt.price;
+      const budget = totalValue * maxPct / 100;
+      const shares = Math.max(1, Math.floor(budget / price));
+      const cost = shares * price;
+
+      if (cost > store.current().cash) {
+        addLog(`⏭ Skip ${candidate.ticker} — insufficient cash ($${store.current().cash.toFixed(0)} < $${cost.toFixed(0)})`);
+        continue;
+      }
+
+      const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
+      const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
+
+      const ok = store.buy({
+        ticker: candidate.ticker.replace('.AX','').replace('-USD',''),
+        name: candidate.name || candidate.ticker,
+        price, exchange: mkt.exchange || 'NYSE',
+        sector: mkt.sector || 'Equity',
+      }, shares, sl, tp, 'auto');
+
+      if (ok) {
+        bought++;
+        addLog(`🟢 BUY ${shares}× ${candidate.ticker} @ $${price.toFixed(2)} | ${candidate.thesis}`);
+        addLog(`   💡 Edge: ${candidate.edge} (${candidate.timeframe}, conviction ${candidate.conviction}/10)`);
+        showToast(`🤖 Bought ${candidate.ticker} — ${candidate.category}`, 'info');
+      }
+    }
+
+    if (bought === 0 && candidates.length > 0) {
+      addLog(`📊 ${candidates.length} candidates found but none executed — price/cash constraints`);
+    }
+
   } catch (e: any) {
-    addLog(`⚠️ Cycle error: ${e.message.slice(0, 50)}`);
+    addLog(`⚠ Cycle error: ${e.message.slice(0, 60)}`);
   }
 }
 
@@ -929,6 +1015,7 @@ function AppInner() {
   const [apMaxPositions, setApMaxPositions] = useState(8);     // max concurrent positions
   const [apTrailingStop, setApTrailingStop] = useState(false); // trail stop up as price rises
   const [apSectors, setApSectors] = useState<string[]>([]);    // sector focus (empty = all)
+  const SECTOR_OPTIONS = ['Technology','Healthcare','Finance','Energy','Consumer','Materials','Industrials','ASX','Crypto','Small-Cap','Emerging Markets'];
 
   // Risk profile presets — auto-fills all sliders
   const RISK_PRESETS: Record<string, {max:number;stop:number;tp:number;conv:number;maxPos:number}> = {
@@ -1013,7 +1100,7 @@ function AppInner() {
       if (apIntervalRef.current) clearInterval(apIntervalRef.current);
       const cycle = () => runAutopilotCycle(
         store, apRisk, apMax, apStop, apTp, totalValue,
-        (msg) => setApLog(l => [{ ts: Date.now(), msg }, ...l].slice(0, 60)),
+        (msg) => setApLog(l => [{ ts: Date.now(), msg }, ...l].slice(0, 80)),
         showToast, apMinConviction, apMaxPositions, apTrailingStop
       );
       cycle(); // run immediately with new settings
@@ -1590,6 +1677,27 @@ function AppInner() {
                     </div>
                   </div>
 
+                  {/* Sector Focus */}
+                  <div>
+                    <div className="text-[10px] text-white/25 uppercase tracking-wide mb-2">
+                      Sector Focus <span className="text-white/15 normal-case tracking-normal">(empty = scan all markets)</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {SECTOR_OPTIONS.map(s => (
+                        <button key={s} onClick={() => setApSectors(prev => prev.includes(s) ? prev.filter(x => x !== s) : [...prev, s])}
+                          className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${
+                            apSectors.includes(s)
+                              ? 'bg-violet-500/20 text-violet-300 border-violet-500/30'
+                              : 'bg-[#1f1f2e] text-white/30 border-white/8 hover:text-white/60'
+                          }`}>{s}</button>
+                      ))}
+                    </div>
+                    {apSectors.length === 0
+                      ? <div className="text-[10px] text-white/20 mt-1">Scanning entire global market for hidden gems</div>
+                      : <div className="text-[10px] text-violet-400/60 mt-1">Focused on: {apSectors.join(', ')}</div>
+                    }
+                  </div>
+
                   {/* Current settings summary */}
                   <div className="bg-[#1a1a2a] rounded-lg p-3 text-[10px] text-white/30 space-y-1">
                     <div className="text-white/50 font-semibold mb-1.5">Active Settings</div>
@@ -1608,12 +1716,18 @@ function AppInner() {
                     <div className="text-center py-8 text-white/25 text-sm">Enable autopilot to start logging activity</div>
                   ) : (
                     <div className="space-y-0 max-h-96 overflow-y-auto">
-                      {apLog.map((l, i) => (
-                        <div key={i} className="flex justify-between py-2 border-b border-white/5 last:border-0 text-xs">
-                          <span className="text-white/55">{l.msg}</span>
-                          <span className="text-white/25 whitespace-nowrap ml-3">{new Date(l.ts).toLocaleTimeString('en-AU', {hour:'2-digit',minute:'2-digit'})}</span>
-                        </div>
-                      ))}
+                      {apLog.map((l, i) => {
+                        const isGreen = l.msg.startsWith('🟢') || l.msg.startsWith('🎯');
+                        const isRed = l.msg.startsWith('🛑') || l.msg.startsWith('📉');
+                        const isBlue = l.msg.startsWith('🧠') || l.msg.startsWith('🔍') || l.msg.startsWith('📋');
+                        const isIndent = l.msg.startsWith('   ');
+                        return (
+                          <div key={i} className={`flex justify-between py-1.5 border-b border-white/5 last:border-0 text-xs ${isIndent ? 'pl-3' : ''}`}>
+                            <span className={isGreen ? 'text-green-400/80' : isRed ? 'text-red-400/80' : isBlue ? 'text-blue-400/70' : 'text-white/50'}>{l.msg}</span>
+                            <span className="text-white/20 whitespace-nowrap ml-3 shrink-0">{new Date(l.ts).toLocaleTimeString('en-AU', {hour:'2-digit',minute:'2-digit'})}</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
