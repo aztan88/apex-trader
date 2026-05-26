@@ -1152,8 +1152,8 @@ function AppInner() {
       const priceMap = await fetchPrices(tickers);
       const successfulPrices = Object.values(priceMap).filter((v: any) => v.price > 0).length;
       if (successfulPrices === 0) {
-        setScreenStatus('Price API returned no data. Yahoo Finance may be rate-limited — try again in 30 seconds.');
-        showToast('No price data returned. Try again shortly.', 'err');
+        setScreenStatus('Price API returned no data — Yahoo Finance may be temporarily unavailable. Try again in 30 seconds.');
+        showToast('No price data. Check /api/health for diagnosis.', 'err');
         setScreenLoading(false);
         setScreeningCount(0);
         return;
@@ -1180,8 +1180,20 @@ function AppInner() {
             ...sig,
           } as StockCard;
         } catch (e: any) {
-          console.error('[screener] signal error for', tk, e?.message);
-          return null;
+          // Rate limited — show the card with price data but no AI signals
+          console.warn('[screener] signal error for', tk, e?.message?.slice(0,60));
+          return {
+            ticker: tk.replace('.AX','').replace('-USD',''),
+            name: mkt.name || tk,
+            price: mkt.price, change1d: mkt.change1d, change52w: mkt.change52w,
+            marketCap: mkt.marketCap, currency: mkt.currency, exchange: mkt.exchange,
+            sector: mkt.sector, source: mkt.source, history: mkt.history ?? [],
+            high52w: mkt.high52w ?? 0, low52w: mkt.low52w ?? 0, volume: mkt.volume ?? 0,
+            conviction: 5, upside: 10, recommendation: 'Hold', riskLevel: 'Medium',
+            rsiEstimate: 50, macdSignal: 'Neutral', trend: 'Sideways', candleSignal: 'None',
+            entryPrice: mkt.price, stopLoss: mkt.price * 0.92, targetPrice: mkt.price * 1.15,
+            thesis: 'AI signals unavailable — rate limit reached. Price data loaded.', risks: '', catalysts: [],
+          } as StockCard;
         }
       });
 

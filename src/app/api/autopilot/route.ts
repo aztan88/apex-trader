@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { groq } from '@/lib/groq';
+import { groqDeep } from '@/lib/groq';
 
 // Cache discoveries for 2 hours — we don't want to re-research every 30 seconds
 const discoveryCache = new Map<string, { data: Discovery[]; ts: number }>();
@@ -81,7 +81,7 @@ export async function POST(req: NextRequest) {
 
     const prompt = buildDiscoveryPrompt(risk, sectors, existingTickers, cash, totalValue, minConviction);
 
-    const txt = await groq(
+    const txt = await groqDeep(
       'You are a systematic quantitative analyst. Return only the pipe-delimited lines as instructed. No markdown, no explanations.',
       prompt,
       600

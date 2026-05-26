@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { groq } from '@/lib/groq';
+import { groqDeep } from '@/lib/groq';
 
 const analysisCache = new Map<string, string>();
 
@@ -30,7 +30,7 @@ P4: Biggest risk and position sizing (1-2 sentences)
 No headers. No bullets. No disclaimers. Be specific.`;
 
   try {
-    const analysis = await groq('Senior equity analyst. Specific, concise, no disclaimers.', prompt, 500);
+    const analysis = await groqDeep('Senior equity analyst. Specific, concise, no disclaimers.', prompt, 500);
     analysisCache.set(ticker, analysis);
     return NextResponse.json({ analysis }, { headers: { 'Cache-Control': 's-maxage=86400' } });
   } catch (e: any) {
