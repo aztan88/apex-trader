@@ -533,6 +533,73 @@ function PortfolioChart({ history }: { history: {ts:number;value:number}[] }) {
   return <div className="h-40 relative"><canvas ref={canvasRef} /></div>;
 }
 
+// ── Shared buy execution helper ───────────────────────────────────────────────
+async function executeBuys(
+  candidates: any[],
+  existingKeys: string[],
+  store: { current: () => { cash: number; positions: Record<string, any> }; buy: (...a: any[]) => boolean },
+  maxPositions: number, maxPct: number, stopPct: number, tpPct: number,
+  totalValue: number, addLog: (msg: string) => void, showToast: (m: string, t?: any) => void
+) {
+  const slotsAvailable = maxPositions - Object.keys(store.current().positions).length;
+  if (slotsAvailable <= 0) { addLog('💼 Max positions reached'); return; }
+
+  const toEvaluate = candidates.slice(0, Math.min(slotsAvailable + 2, 5));
+  addLog(`💰 Evaluating ${toEvaluate.length} candidates with live prices…`);
+
+  const tickerList = toEvaluate.map((d: any) => d.ticker).join(',');
+  try {
+    const priceRes = await fetch(`/api/prices?tickers=${encodeURIComponent(tickerList)}`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!priceRes.ok) { addLog('⚠ Price fetch failed'); return; }
+    const priceMap = await priceRes.json();
+
+    let bought = 0;
+    for (const candidate of toEvaluate) {
+      if (bought >= slotsAvailable) break;
+      if (store.current().cash < totalValue * 0.04) { addLog('💸 Insufficient cash to continue'); break; }
+
+      const mkt = priceMap[candidate.ticker] ?? priceMap[candidate.ticker.replace('.AX','').replace('-USD','')];
+      if (!mkt || mkt.error || !mkt.price || mkt.price <= 0) {
+        addLog(`⏭ Skip ${candidate.ticker} — no price data`);
+        continue;
+      }
+
+      const price = mkt.price;
+      const budget = totalValue * maxPct / 100;
+      const shares = Math.max(1, Math.floor(budget / price));
+      const cost = shares * price;
+
+      if (cost > store.current().cash) {
+        addLog(`⏭ Skip ${candidate.ticker} — need $${cost.toFixed(0)}, have $${store.current().cash.toFixed(0)}`);
+        continue;
+      }
+
+      const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
+      const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
+
+      const ok = store.buy({
+        ticker: candidate.ticker.replace('.AX','').replace('-USD',''),
+        name: candidate.name || candidate.ticker,
+        price, exchange: mkt.exchange || 'NYSE',
+        sector: mkt.sector || 'Equity',
+      }, shares, sl, tp, 'auto');
+
+      if (ok) {
+        bought++;
+        addLog(`🟢 BUY ${shares}× ${candidate.ticker} @ $${price.toFixed(2)} | ${candidate.thesis}`);
+        if (candidate.edge) addLog(`   💡 Edge: ${candidate.edge} (${candidate.timeframe || 'weeks'}, conviction ${candidate.conviction}/10)`);
+        showToast(`🤖 Bought ${candidate.ticker}`, 'info');
+      }
+    }
+
+    if (bought === 0) addLog(`📊 ${toEvaluate.length} evaluated — none met execution criteria`);
+  } catch (e: any) {
+    addLog(`⚠ Price fetch error: ${e.message.slice(0, 50)}`);
+  }
+}
+
 // ── Autopilot cycle — quant-style discovery + execution ──────────────────────
 async function runAutopilotCycle(
   store: { current: () => { cash: number; positions: Record<string, any> }; buy: (...a: any[]) => boolean; sell: (...a: any[]) => boolean },
@@ -616,82 +683,42 @@ async function runAutopilotCycle(
         risk, minConviction, cash: updatedCash, totalValue,
         existingTickers: updatedKeys,
         sectors: [],
-        forceRefresh: sold.length > 0 || trimmed.length > 0, // refresh if we just sold
+        forceRefresh: sold.length > 0 || trimmed.length > 0,
       }),
+      signal: AbortSignal.timeout(40000), // 40s timeout
     });
 
-    if (!discoverRes.ok) { addLog('⚠ Discovery service unavailable'); return; }
-    const { discoveries, cached, cacheAge } = await discoverRes.json();
+    const discoverData = await discoverRes.json();
+
+    if (!discoverRes.ok || discoverData.error) {
+      // Show the actual error, then fall back to a curated discovery list
+      addLog(`⚠ Discovery API: ${discoverData.error ?? 'HTTP ' + discoverRes.status} — using fallback list`);
+      // Fallback: use screener tickers based on risk profile
+      const fallbackTheme = risk === 'aggressive' ? 'high_return' : risk === 'conservative' ? 'value' : 'growth';
+      const screenerRes = await fetch(`/api/screener?theme=${fallbackTheme}`);
+      const screenerData = await screenerRes.json();
+      const fallbackTickers: string[] = (screenerData.tickers ?? []).filter((t: string) => !updatedKeys.includes(t)).slice(0, 4);
+      if (fallbackTickers.length === 0) { addLog('No fallback candidates available'); return; }
+      addLog(`📋 Using ${fallbackTickers.length} fallback candidates from ${fallbackTheme} theme`);
+      // Execute with fallback
+      await executeBuys(fallbackTickers.map((t: string) => ({ ticker: t, name: t, thesis: 'Screener pick', edge: 'Systematic selection', conviction: minConviction, category: 'screener', timeframe: 'weeks', riskNote: '' })), updatedKeys, store, maxPositions, maxPct, stopPct, tpPct, totalValue, addLog, showToast);
+      return;
+    }
+
+    const { discoveries, cached, cacheAge } = discoverData;
 
     if (!discoveries?.length) { addLog('⚠ No discoveries returned'); return; }
 
     const source = cached ? `cached ${cacheAge}` : 'fresh scan';
     addLog(`📋 ${discoveries.length} candidates found (${source})`);
 
-    // Filter by conviction and not already holding
     const candidates = (discoveries as any[])
       .filter(d => d.conviction >= minConviction && !updatedKeys.includes(d.ticker))
       .sort((a, b) => b.conviction - a.conviction);
 
-    if (candidates.length === 0) {
-      addLog(`No candidates meet conviction ≥${minConviction} threshold`);
-      return;
-    }
+    if (candidates.length === 0) { addLog(`No candidates meet conviction ≥${minConviction} threshold`); return; }
 
-    // ── PHASE 3: Fetch real prices and execute best opportunities ────────────
-    const slotsAvailable = maxPositions - updatedKeys.length;
-    const toEvaluate = candidates.slice(0, Math.min(slotsAvailable + 2, 4)); // evaluate top 4
-
-    addLog(`💰 Evaluating ${toEvaluate.length} candidates with live prices…`);
-
-    // Fetch prices in parallel
-    const tickerList = toEvaluate.map((d: any) => d.ticker).join(',');
-    const priceRes = await fetch(`/api/prices?tickers=${encodeURIComponent(tickerList)}`);
-    if (!priceRes.ok) { addLog('⚠ Price fetch failed'); return; }
-    const priceMap = await priceRes.json();
-
-    let bought = 0;
-    for (const candidate of toEvaluate) {
-      if (bought >= slotsAvailable) break;
-      if (store.current().cash < totalValue * 0.05) break; // under 5% cash, stop
-
-      const mkt = priceMap[candidate.ticker] ?? priceMap[candidate.ticker.replace('.AX','').replace('-USD','')];
-      if (!mkt || mkt.error || !mkt.price || mkt.price <= 0) {
-        addLog(`⏭ Skip ${candidate.ticker} — no price data`);
-        continue;
-      }
-
-      const price = mkt.price;
-      const budget = totalValue * maxPct / 100;
-      const shares = Math.max(1, Math.floor(budget / price));
-      const cost = shares * price;
-
-      if (cost > store.current().cash) {
-        addLog(`⏭ Skip ${candidate.ticker} — insufficient cash ($${store.current().cash.toFixed(0)} < $${cost.toFixed(0)})`);
-        continue;
-      }
-
-      const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
-      const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
-
-      const ok = store.buy({
-        ticker: candidate.ticker.replace('.AX','').replace('-USD',''),
-        name: candidate.name || candidate.ticker,
-        price, exchange: mkt.exchange || 'NYSE',
-        sector: mkt.sector || 'Equity',
-      }, shares, sl, tp, 'auto');
-
-      if (ok) {
-        bought++;
-        addLog(`🟢 BUY ${shares}× ${candidate.ticker} @ $${price.toFixed(2)} | ${candidate.thesis}`);
-        addLog(`   💡 Edge: ${candidate.edge} (${candidate.timeframe}, conviction ${candidate.conviction}/10)`);
-        showToast(`🤖 Bought ${candidate.ticker} — ${candidate.category}`, 'info');
-      }
-    }
-
-    if (bought === 0 && candidates.length > 0) {
-      addLog(`📊 ${candidates.length} candidates found but none executed — price/cash constraints`);
-    }
+    await executeBuys(candidates, updatedKeys, store, maxPositions, maxPct, stopPct, tpPct, totalValue, addLog, showToast);
 
   } catch (e: any) {
     addLog(`⚠ Cycle error: ${e.message.slice(0, 60)}`);
