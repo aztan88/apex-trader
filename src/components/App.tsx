@@ -1093,6 +1093,8 @@ function AppInner() {
   const [sidebarOpen, setSidebarOpen] = useState(false); // FIX #13 mobile
   const [clockTick, setClockTick] = useState(0);
   useEffect(() => { const t = setInterval(() => setClockTick(v => v+1), 60000); return () => clearInterval(t); }, []);
+  const [lastPriceRefresh, setLastPriceRefresh] = useState<Date | null>(null);
+  const [priceRefreshError, setPriceRefreshError] = useState(false);
   const apIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const store = useTraderStore();
@@ -1110,30 +1112,57 @@ function AppInner() {
     setTimeout(() => setToast(null), Math.max(3000, msg.length * 60));
   }, []);
 
-  // Price tick simulation
+  // Live price refresh — fetch real prices for all open positions every 60 seconds
+  // No simulation. All prices come from Yahoo Finance via /api/prices.
   useEffect(() => {
-    const tick = () => {
+    const refreshPrices = async () => {
       const positions = store.current().positions;
-      for (const [ticker, pos] of Object.entries(positions)) {
-        // Realistic simulation: ~1.5% daily vol for tech, 0.8% for others, 3% crypto
-        // No artificial drift — paper trading should reflect real market randomness
-        // 15s interval = 1560 ticks per trading day. Daily vol / sqrt(1560) per tick.
-        const dailyVol = pos.sector === 'Crypto' ? 0.03 : pos.sector === 'Technology' ? 0.015 : 0.008;
-        const tickVol = dailyVol / Math.sqrt(1560);
-        const drift = 0; // no artificial drift — let AI picks drive returns
-        const newPrice = Math.max(0.01, pos.currentPrice * (1 + drift + (Math.random() - 0.5) * tickVol));
-        store.updatePrice(ticker, r2(newPrice));
+      const tickers = Object.keys(positions);
+      if (!tickers.length) return;
+
+      try {
+        // Build ticker list using original exchange-suffixed tickers where possible
+        const tickerList = tickers.join(',');
+        const res = await fetch(`/api/prices?tickers=${encodeURIComponent(tickerList)}`, {
+          signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) return;
+        const priceMap = await res.json();
+
+        let anyUpdate = false;
+        for (const ticker of tickers) {
+          const data = priceMap[ticker] ?? priceMap[ticker.replace('.AX','').replace('-USD','')];
+          if (data?.price && data.price > 0) {
+            store.updatePrice(ticker, data.price);
+            anyUpdate = true;
+          }
+        }
+
+        if (anyUpdate) {
+          setLastPriceRefresh(new Date());
+          setPriceRefreshError(false);
+          // Check stop-losses and take-profits against real prices
+          const triggered = store.checkStopsAndTPs();
+          triggered.forEach(t => {
+            showToast(
+              t.type === 'stop'
+                ? `🛑 Stop loss: sold ${t.shares}× ${t.ticker} @ $${fmt(t.price)}`
+                : `🎯 Take profit: sold ${t.shares}× ${t.ticker} @ $${fmt(t.price)}`,
+              t.type === 'stop' ? 'err' : 'ok'
+            );
+          });
+          store.recordHistory();
+        }
+      } catch (e: any) {
+        // Price refresh failed silently — prices stay at last known value
+        console.warn('[prices] refresh error:', e?.message?.slice(0, 60));
+        setPriceRefreshError(true);
       }
-      const triggered = store.checkStopsAndTPs();
-      triggered.forEach(t => {
-        showToast(
-          t.type === 'stop' ? `🛑 Stop loss: sold ${t.shares}× ${t.ticker} @ $${fmt(t.price)}` : `🎯 Take profit: sold ${t.shares}× ${t.ticker} @ $${fmt(t.price)}`,
-          t.type === 'stop' ? 'err' : 'ok'
-        );
-      });
-      if (triggered.length) store.recordHistory();
     };
-    const interval = setInterval(tick, 15000);
+
+    // Refresh immediately on mount, then every 60 seconds
+    refreshPrices().then(() => setLastPriceRefresh(new Date()));
+    const interval = setInterval(refreshPrices, 60000);
     return () => clearInterval(interval);
   }, []);
 
@@ -1446,6 +1475,12 @@ function AppInner() {
           <div className="font-serif text-xl min-w-0 truncate">{pageLabel[page]}</div>
           <div className="flex items-center gap-3 shrink-0 flex-wrap">
             <ModeSwitcher onValidate={(result) => setValidationResult(result)} />
+            {lastPriceRefresh && (
+              <div className={`hidden lg:flex items-center gap-1.5 text-[10px] ${priceRefreshError ? 'text-red-400/60' : 'text-white/25'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${priceRefreshError ? 'bg-red-400' : 'bg-green-400 animate-pulse'}`} />
+                {priceRefreshError ? 'Price refresh failed' : `Live · ${lastPriceRefresh.toLocaleTimeString('en-AU', {hour:'2-digit',minute:'2-digit'})}`}
+              </div>
+            )}
             {page !== 'search' && <span className="hidden lg:block text-xs text-white/20 opacity-50">⌘K</span>}
             {apOn && <span className="flex items-center gap-1.5 text-xs text-violet-400"><span className="w-1.5 h-1.5 rounded-full bg-violet-500 animate-pulse" />Autopilot</span>}
           </div>
