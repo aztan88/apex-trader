@@ -258,6 +258,21 @@ function OrderModal({ stock, onClose, showToast }: {
   const { mode } = store;
   const current = store.current();
   const totalValue = getPortfolioValue(current);
+
+  // Apply screener filters to full stock list
+  const filteredStocks = useMemo(() => {
+    return allStocks.filter(s => {
+      if (filterConviction > 0 && s.conviction < filterConviction) return false;
+      if (filterRisk.length > 0 && !filterRisk.includes(s.riskLevel)) return false;
+      if (filterRec.length > 0 && !filterRec.some(r => s.recommendation.includes(r))) return false;
+      if (s.rsiEstimate < filterRsiMin || s.rsiEstimate > filterRsiMax) return false;
+      if (filterMacd.length > 0 && !filterMacd.some(m => s.macdSignal.includes(m))) return false;
+      if (filterTrend.length > 0 && !filterTrend.some(t => s.trend.includes(t))) return false;
+      return true;
+    });
+  }, [allStocks, filterConviction, filterRisk, filterRec, filterRsiMin, filterRsiMax, filterMacd, filterTrend]);
+
+  const displayedStocks = filteredStocks.slice(0, loadMoreCount);
   const existing = current.positions[stock.ticker];
 
   useEffect(() => {
@@ -1023,7 +1038,17 @@ function AppInner() {
   const [theme, setTheme] = useState('all');
   const [stocks, setStocks] = useState<StockCard[]>([]);
   const [screenLoading, setScreenLoading] = useState(false);
-  const [screeningCount, setScreeningCount] = useState(0); // FIX #14: skeleton count
+  const [screeningCount, setScreeningCount] = useState(0);
+  const [allStocks, setAllStocks] = useState<StockCard[]>([]); // full unfiltered list
+  const [filterConviction, setFilterConviction] = useState(0);  // min conviction (0 = all)
+  const [filterRisk, setFilterRisk] = useState<string[]>([]);   // selected risk levels
+  const [filterRec, setFilterRec] = useState<string[]>([]);     // selected recommendations
+  const [filterRsiMin, setFilterRsiMin] = useState(0);
+  const [filterRsiMax, setFilterRsiMax] = useState(100);
+  const [filterMacd, setFilterMacd] = useState<string[]>([]);
+  const [filterTrend, setFilterTrend] = useState<string[]>([]);
+  const [showFilters, setShowFilters] = useState(false);
+  const [loadMoreCount, setLoadMoreCount] = useState(12); // FIX #14: skeleton count
   const [screenStatus, setScreenStatus] = useState('');
   const [orderStock, setOrderStock] = useState<StockCard | null>(null);
   const [searchQ, setSearchQ] = useState('');
@@ -1090,8 +1115,13 @@ function AppInner() {
     const tick = () => {
       const positions = store.current().positions;
       for (const [ticker, pos] of Object.entries(positions)) {
-        const vol = pos.sector === 'Crypto' ? 0.02 : pos.sector === 'Technology' ? 0.009 : 0.006;
-        const newPrice = Math.max(0.01, pos.currentPrice * (1 + 0.0002 + (Math.random() - 0.485) * vol));
+        // Realistic simulation: ~1.5% daily vol for tech, 0.8% for others, 3% crypto
+        // No artificial drift — paper trading should reflect real market randomness
+        // 15s interval = 1560 ticks per trading day. Daily vol / sqrt(1560) per tick.
+        const dailyVol = pos.sector === 'Crypto' ? 0.03 : pos.sector === 'Technology' ? 0.015 : 0.008;
+        const tickVol = dailyVol / Math.sqrt(1560);
+        const drift = 0; // no artificial drift — let AI picks drive returns
+        const newPrice = Math.max(0.01, pos.currentPrice * (1 + drift + (Math.random() - 0.5) * tickVol));
         store.updatePrice(ticker, r2(newPrice));
       }
       const triggered = store.checkStopsAndTPs();
@@ -1203,7 +1233,9 @@ function AppInner() {
         const card = await job;
         if (card) {
           results.push(card);
+          setAllStocks([...results]);
           setStocks([...results]);
+          setLoadMoreCount(12);
           setScreenStatus(`${results.length}/${tickers.length} stocks loaded…`);
         }
       }
@@ -1299,10 +1331,18 @@ function AppInner() {
   };
 
   // ── Quick buy ───────────────────────────────────────────────────────────
+  // Realistic brokerage: ASX $9.95, US free (Stake/Alpaca model), crypto 0.1%
+  const getBrokerageFee = (stock: StockCard, total: number): number => {
+    if (stock.exchange?.toUpperCase().includes('ASX') || stock.currency === 'AUD') return 9.95;
+    if (stock.exchange === 'Crypto' || stock.ticker?.includes('-USD')) return total * 0.001;
+    return 0;
+  };
+
   const quickBuy = (stock: StockCard) => {
     const shares = Math.max(1, Math.floor(current.cash * 0.05 / stock.price));
-    const ok = store.buy(stock, shares, stock.stopLoss || null, stock.targetPrice || null);
-    if (ok) showToast(`✓ Bought ${shares}× ${stock.ticker} @ $${fmt(stock.price)}`);
+    const fee = getBrokerageFee(stock, shares * stock.price);
+    const ok = store.buy(stock, shares, stock.stopLoss || null, stock.targetPrice || null, 'manual', undefined, undefined, fee);
+    if (ok) showToast(`✓ Bought ${shares}× ${stock.ticker} @ $${fmt(stock.price)}${fee > 0 ? ` (fee: $${fee.toFixed(2)})` : ''}`);
     else showToast('Insufficient cash', 'err');
   };
 
@@ -1450,8 +1490,110 @@ function AppInner() {
                   className="px-6 py-2.5 bg-green-500 text-black text-sm font-semibold rounded-xl hover:bg-green-400 disabled:opacity-60 transition-colors">
                   {screenLoading ? '⟳ Scanning…' : '✦ Run AI Screener'}
                 </button>
-                <span className="text-xs text-white/35">{screenStatus}</span>
+                {allStocks.length > 0 && (
+                  <button onClick={() => setShowFilters(v => !v)}
+                    className={`px-4 py-2.5 text-sm font-medium rounded-xl border transition-colors ${
+                      showFilters ? 'bg-violet-500/15 text-violet-300 border-violet-500/30' : 'bg-white/5 text-white/50 border-white/10 hover:border-white/25'
+                    }`}>
+                    {showFilters ? '▲' : '▼'} Filters {(filterConviction > 0 || filterRisk.length || filterRec.length || filterMacd.length || filterTrend.length || filterRsiMin > 0 || filterRsiMax < 100) ? '●' : ''}
+                  </button>
+                )}
+                <span className="text-xs text-white/35">
+                  {allStocks.length > 0 ? `${filteredStocks.length}/${allStocks.length} stocks` : screenStatus}
+                </span>
               </div>
+
+              {/* Filter panel */}
+              {showFilters && allStocks.length > 0 && (
+                <div className="bg-[#13131f] border border-white/8 rounded-xl p-4 mb-5">
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="text-[10px] text-white/30 uppercase tracking-wide">Filter Results</div>
+                    <button onClick={() => {
+                      setFilterConviction(0); setFilterRisk([]); setFilterRec([]);
+                      setFilterRsiMin(0); setFilterRsiMax(100); setFilterMacd([]); setFilterTrend([]);
+                    }} className="text-[10px] text-white/30 hover:text-white/60 transition-colors">Clear all</button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                    {/* Conviction */}
+                    <div>
+                      <div className="flex justify-between mb-1.5">
+                        <label className="text-[10px] text-white/30 uppercase tracking-wide">Min Conviction</label>
+                        <span className="text-[10px] font-mono text-white/60">{filterConviction > 0 ? `≥ ${filterConviction}/10` : 'Any'}</span>
+                      </div>
+                      <input type="range" min={0} max={10} step={1} value={filterConviction}
+                        onChange={e => setFilterConviction(parseInt(e.target.value))} className="w-full accent-green-500" />
+                      <div className="flex justify-between text-[9px] text-white/20 mt-0.5">
+                        <span>Any</span><span>10</span>
+                      </div>
+                    </div>
+                    {/* RSI Range */}
+                    <div>
+                      <div className="flex justify-between mb-1.5">
+                        <label className="text-[10px] text-white/30 uppercase tracking-wide">RSI Range</label>
+                        <span className="text-[10px] font-mono text-white/60">{filterRsiMin}–{filterRsiMax}</span>
+                      </div>
+                      <div className="flex gap-2 items-center">
+                        <input type="number" min={0} max={100} value={filterRsiMin}
+                          onChange={e => setFilterRsiMin(Math.min(parseInt(e.target.value)||0, filterRsiMax))}
+                          className="w-16 bg-[#1f1f2e] border border-white/10 rounded px-2 py-1 text-xs font-mono text-center outline-none focus:border-green-500/50" />
+                        <span className="text-white/20 text-xs">to</span>
+                        <input type="number" min={0} max={100} value={filterRsiMax}
+                          onChange={e => setFilterRsiMax(Math.max(parseInt(e.target.value)||100, filterRsiMin))}
+                          className="w-16 bg-[#1f1f2e] border border-white/10 rounded px-2 py-1 text-xs font-mono text-center outline-none focus:border-green-500/50" />
+                      </div>
+                      <div className="text-[9px] text-white/20 mt-1">e.g. 30–70 for non-extreme RSI</div>
+                    </div>
+                    {/* Recommendation */}
+                    <div>
+                      <label className="text-[10px] text-white/30 uppercase tracking-wide block mb-1.5">Recommendation</label>
+                      <div className="flex flex-wrap gap-1">
+                        {['Strong Buy','Buy','Hold','Speculative Buy','Sell'].map(r => (
+                          <button key={r} onClick={() => setFilterRec(prev => prev.includes(r) ? prev.filter(x=>x!==r) : [...prev, r])}
+                            className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${filterRec.includes(r) ? 'bg-green-500/20 text-green-300 border-green-500/30' : 'bg-[#1f1f2e] text-white/30 border-white/8 hover:text-white/60'}`}>
+                            {r}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {/* Risk */}
+                    <div>
+                      <label className="text-[10px] text-white/30 uppercase tracking-wide block mb-1.5">Risk Level</label>
+                      <div className="flex flex-wrap gap-1">
+                        {['Low','Medium','High','Very High'].map(r => (
+                          <button key={r} onClick={() => setFilterRisk(prev => prev.includes(r) ? prev.filter(x=>x!==r) : [...prev, r])}
+                            className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${filterRisk.includes(r) ? 'bg-amber-500/20 text-amber-300 border-amber-500/30' : 'bg-[#1f1f2e] text-white/30 border-white/8 hover:text-white/60'}`}>
+                            {r}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {/* MACD */}
+                    <div>
+                      <label className="text-[10px] text-white/30 uppercase tracking-wide block mb-1.5">MACD Signal</label>
+                      <div className="flex flex-wrap gap-1">
+                        {['Bullish','Neutral','Bearish'].map(m => (
+                          <button key={m} onClick={() => setFilterMacd(prev => prev.includes(m) ? prev.filter(x=>x!==m) : [...prev, m])}
+                            className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${filterMacd.includes(m) ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' : 'bg-[#1f1f2e] text-white/30 border-white/8 hover:text-white/60'}`}>
+                            {m}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {/* Trend */}
+                    <div>
+                      <label className="text-[10px] text-white/30 uppercase tracking-wide block mb-1.5">Trend</label>
+                      <div className="flex flex-wrap gap-1">
+                        {['Strong Uptrend','Uptrend','Sideways','Downtrend','Strong Downtrend'].map(t => (
+                          <button key={t} onClick={() => setFilterTrend(prev => prev.includes(t) ? prev.filter(x=>x!==t) : [...prev, t])}
+                            className={`px-2 py-1 rounded text-[10px] font-medium transition-all border ${filterTrend.includes(t) ? 'bg-teal-500/20 text-teal-300 border-teal-500/30' : 'bg-[#1f1f2e] text-white/30 border-white/8 hover:text-white/60'}`}>
+                            {t.replace('trend','').replace('Trend','').trim() || t}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* FIX #28: proper empty state */}
               {stocks.length === 0 && !screenLoading && screeningCount === 0 && (
@@ -1470,7 +1612,7 @@ function AppInner() {
               )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                {stocks.map(s => (
+                {displayedStocks.map(s => (
                   <DiscoveryCard key={s.ticker} stock={s} selected={orderStock?.ticker === s.ticker}
                     onClick={() => setOrderStock(s)}
                     onBuy={() => quickBuy(s)}
@@ -1478,6 +1620,30 @@ function AppInner() {
                   />
                 ))}
               </div>
+
+              {/* Load More row */}
+              {filteredStocks.length > 0 && (
+                <div className="flex items-center justify-between mt-5 pt-4 border-t border-white/5">
+                  <div className="text-xs text-white/30">
+                    Showing {Math.min(loadMoreCount, filteredStocks.length)} of {filteredStocks.length} stocks
+                    {allStocks.length !== filteredStocks.length && ` · ${allStocks.length - filteredStocks.length} filtered`}
+                  </div>
+                  <div className="flex gap-2">
+                    {loadMoreCount < filteredStocks.length && (
+                      <button onClick={() => setLoadMoreCount(v => v + 12)}
+                        className="px-4 py-2 text-sm font-medium bg-white/5 text-white/60 border border-white/10 rounded-xl hover:border-white/25 transition-colors">
+                        Load 12 More ↓
+                      </button>
+                    )}
+                    {loadMoreCount < filteredStocks.length && (
+                      <button onClick={() => setLoadMoreCount(filteredStocks.length)}
+                        className="px-4 py-2 text-sm font-medium bg-white/5 text-white/60 border border-white/10 rounded-xl hover:border-white/25 transition-colors">
+                        Show All ({filteredStocks.length})
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -1550,7 +1716,16 @@ function AppInner() {
                   <div className="grid grid-cols-3 gap-3">
                     {[
                       ['Positions', Object.keys(current.positions).length],
-                      ['Win Rate', (() => { const sells = current.transactions.filter(t=>t.type==='sell'&&t.source==='manual'); const wins = sells.filter(s=>{ const b=current.transactions.find(t=>t.type==='buy'&&t.ticker===s.ticker); return b&&s.price>b.price; }); return sells.length ? Math.round(wins.length/sells.length*100)+'%' : 'N/A'; })()],
+                      ['Win Rate', (() => {
+                        const sells = current.transactions.filter(t => t.type === 'sell');
+                        const wins = sells.filter(s => {
+                          const buys = current.transactions.filter(t => t.type === 'buy' && t.ticker === s.ticker && t.ts < s.ts);
+                          if (!buys.length) return false;
+                          const avgBuy = buys.reduce((a, b) => a + b.price, 0) / buys.length;
+                          return s.price > avgBuy;
+                        });
+                        return sells.length >= 1 ? Math.round(wins.length / sells.length * 100) + '%' : 'N/A';
+                      })()],
                       ['Trades', current.transactions.length],
                     ].map(([l,v]) => (
                       <div key={String(l)} className="text-center">
