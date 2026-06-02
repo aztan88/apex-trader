@@ -259,20 +259,6 @@ function OrderModal({ stock, onClose, showToast }: {
   const current = store.current();
   const totalValue = getPortfolioValue(current);
 
-  // Apply screener filters to full stock list
-  const filteredStocks = useMemo(() => {
-    return allStocks.filter(s => {
-      if (filterConviction > 0 && s.conviction < filterConviction) return false;
-      if (filterRisk.length > 0 && !filterRisk.includes(s.riskLevel)) return false;
-      if (filterRec.length > 0 && !filterRec.some(r => s.recommendation.includes(r))) return false;
-      if (s.rsiEstimate < filterRsiMin || s.rsiEstimate > filterRsiMax) return false;
-      if (filterMacd.length > 0 && !filterMacd.some(m => s.macdSignal.includes(m))) return false;
-      if (filterTrend.length > 0 && !filterTrend.some(t => s.trend.includes(t))) return false;
-      return true;
-    });
-  }, [allStocks, filterConviction, filterRisk, filterRec, filterRsiMin, filterRsiMax, filterMacd, filterTrend]);
-
-  const displayedStocks = filteredStocks.slice(0, loadMoreCount);
   const existing = current.positions[stock.ticker];
 
   useEffect(() => {
@@ -1111,6 +1097,21 @@ function AppInner() {
     setToast({ msg, type });
     setTimeout(() => setToast(null), Math.max(3000, msg.length * 60));
   }, []);
+
+  // Apply screener filters to full stock list
+  const filteredStocks = useMemo(() => {
+    return allStocks.filter(s => {
+      if (filterConviction > 0 && s.conviction < filterConviction) return false;
+      if (filterRisk.length > 0 && !filterRisk.includes(s.riskLevel)) return false;
+      if (filterRec.length > 0 && !filterRec.some(r => s.recommendation.includes(r))) return false;
+      if (s.rsiEstimate < filterRsiMin || s.rsiEstimate > filterRsiMax) return false;
+      if (filterMacd.length > 0 && !filterMacd.some(m => s.macdSignal.includes(m))) return false;
+      if (filterTrend.length > 0 && !filterTrend.some(t => s.trend.includes(t))) return false;
+      return true;
+    });
+  }, [allStocks, filterConviction, filterRisk, filterRec, filterRsiMin, filterRsiMax, filterMacd, filterTrend]);
+
+  const displayedStocks = filteredStocks.slice(0, loadMoreCount);
 
   // Live price refresh — fetch real prices for all open positions every 60 seconds
   // No simulation. All prices come from Yahoo Finance via /api/prices.
