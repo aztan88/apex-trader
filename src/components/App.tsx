@@ -1544,10 +1544,76 @@ function AppInner() {
                 <div className="bg-[#13131f] border border-white/8 rounded-xl p-4 mb-5">
                   <div className="flex items-center justify-between mb-4">
                     <div className="text-[10px] text-white/30 uppercase tracking-wide">Filter Results</div>
-                    <button onClick={() => {
-                      setFilterConviction(0); setFilterRisk([]); setFilterRec([]);
-                      setFilterRsiMin(0); setFilterRsiMax(100); setFilterMacd([]); setFilterTrend([]);
-                    }} className="text-[10px] text-white/30 hover:text-white/60 transition-colors">Clear all</button>
+                    <div className="flex gap-2">
+                      <button onClick={async () => {
+                        // Search full market using filters via AI
+                        const hasFilter = filterConviction > 0 || filterRisk.length > 0 ||
+                          filterRec.length > 0 || filterMacd.length > 0 ||
+                          filterTrend.length > 0 || filterRsiMin > 0 || filterRsiMax < 100;
+                        if (!hasFilter) { showToast('Set at least one filter to search the market', 'info'); return; }
+                        setScreenLoading(true);
+                        setAllStocks([]);
+                        setStocks([]);
+                        setScreenStatus('🔍 AI scanning full market for your filters…');
+                        try {
+                          const res = await fetch('/api/screener', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              rsiMin: filterRsiMin, rsiMax: filterRsiMax,
+                              conviction: filterConviction,
+                              risk: filterRisk, recommendation: filterRec,
+                              macd: filterMacd, trend: filterTrend,
+                              count: 20,
+                            }),
+                          });
+                          const data = await res.json();
+                          if (!data.tickers?.length) {
+                            setScreenStatus('No stocks found matching those filters');
+                            setScreenLoading(false);
+                            return;
+                          }
+                          setScreenStatus(`Found ${data.tickers.length} matches — fetching prices…`);
+                          // Fetch prices then signals
+                          const priceMap = await fetch(`/api/prices?tickers=${encodeURIComponent(data.tickers.join(','))}`).then(r => r.json());
+                          const successfulPrices = Object.values(priceMap).filter((v: any) => v.price > 0).length;
+                          if (!successfulPrices) { setScreenStatus('No price data returned'); setScreenLoading(false); return; }
+                          setScreenStatus(`Prices loaded — generating AI signals…`);
+                          const results: StockCard[] = [];
+                          for (const tk of data.tickers) {
+                            const mkt = priceMap[tk] ?? priceMap[tk.replace('.AX','').replace('-USD','')];
+                            if (!mkt || !mkt.price || mkt.price <= 0) continue;
+                            try {
+                              const sig = await fetch(`/api/signals?ticker=${encodeURIComponent(tk)}&price=${mkt.price}&name=${encodeURIComponent(mkt.name||tk)}&exchange=${encodeURIComponent(mkt.exchange||'NYSE')}&sector=${encodeURIComponent(mkt.sector||'Equity')}&marketCap=${encodeURIComponent(mkt.marketCap||'N/A')}&change52w=${mkt.change52w||0}&high52w=${mkt.high52w||0}&low52w=${mkt.low52w||0}`).then(r => r.json());
+                              results.push({
+                                ticker: tk.replace('.AX','').replace('-USD',''),
+                                name: sig.name || mkt.name || tk,
+                                price: mkt.price, change1d: mkt.change1d, change52w: mkt.change52w,
+                                marketCap: mkt.marketCap, currency: mkt.currency, exchange: mkt.exchange,
+                                sector: mkt.sector, source: mkt.source, history: mkt.history ?? [],
+                                high52w: mkt.high52w??0, low52w: mkt.low52w??0, volume: mkt.volume??0,
+                                ...sig,
+                              });
+                              setAllStocks([...results]);
+                              setStocks([...results]);
+                            } catch { continue; }
+                            await new Promise(r => setTimeout(r, 80));
+                          }
+                          setScreenStatus(`${results.length} stocks matching your filters · AI-powered market scan`);
+                        } catch (e: any) {
+                          setScreenStatus('Filter search error: ' + e.message);
+                        }
+                        setScreenLoading(false);
+                      }}
+                        disabled={screenLoading}
+                        className="px-3 py-1.5 text-[11px] font-semibold bg-violet-500/15 text-violet-300 border border-violet-500/30 rounded-lg hover:bg-violet-500/25 disabled:opacity-50 transition-colors">
+                        🔍 Search Full Market
+                      </button>
+                      <button onClick={() => {
+                        setFilterConviction(0); setFilterRisk([]); setFilterRec([]);
+                        setFilterRsiMin(0); setFilterRsiMax(100); setFilterMacd([]); setFilterTrend([]);
+                      }} className="text-[10px] text-white/30 hover:text-white/60 transition-colors">Clear all</button>
+                    </div>
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
                     {/* Conviction */}
@@ -1568,16 +1634,25 @@ function AppInner() {
                         <label className="text-[10px] text-white/30 uppercase tracking-wide">RSI Range</label>
                         <span className="text-[10px] font-mono text-white/60">{filterRsiMin}–{filterRsiMax}</span>
                       </div>
-                      <div className="flex gap-2 items-center">
-                        <input type="number" min={0} max={100} value={filterRsiMin}
-                          onChange={e => setFilterRsiMin(Math.min(parseInt(e.target.value)||0, filterRsiMax))}
-                          className="w-16 bg-[#1f1f2e] border border-white/10 rounded px-2 py-1 text-xs font-mono text-center outline-none focus:border-green-500/50" />
-                        <span className="text-white/20 text-xs">to</span>
-                        <input type="number" min={0} max={100} value={filterRsiMax}
-                          onChange={e => setFilterRsiMax(Math.max(parseInt(e.target.value)||100, filterRsiMin))}
-                          className="w-16 bg-[#1f1f2e] border border-white/10 rounded px-2 py-1 text-xs font-mono text-center outline-none focus:border-green-500/50" />
+                      <div className="space-y-1.5">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] text-white/30 w-6">Min</span>
+                          <input type="range" min={0} max={100} step={1} value={filterRsiMin}
+                            onChange={e => setFilterRsiMin(Math.min(parseInt(e.target.value), filterRsiMax))}
+                            className="flex-1 accent-green-500" />
+                          <span className="text-[10px] font-mono text-white/60 w-6 text-right">{filterRsiMin}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] text-white/30 w-6">Max</span>
+                          <input type="range" min={0} max={100} step={1} value={filterRsiMax}
+                            onChange={e => setFilterRsiMax(Math.max(parseInt(e.target.value), filterRsiMin))}
+                            className="flex-1 accent-green-500" />
+                          <span className="text-[10px] font-mono text-white/60 w-6 text-right">{filterRsiMax}</span>
+                        </div>
                       </div>
-                      <div className="text-[9px] text-white/20 mt-1">e.g. 30–70 for non-extreme RSI</div>
+                      <div className="flex justify-between text-[9px] text-white/20 mt-1">
+                        <span>0 = oversold</span><span>100 = overbought</span>
+                      </div>
                     </div>
                     {/* Recommendation */}
                     <div>
@@ -1628,10 +1703,12 @@ function AppInner() {
                       </div>
                     </div>
                   </div>
+                  <div className="mt-3 pt-3 border-t border-white/5 text-[10px] text-white/25 flex items-start gap-2">
+                    <span>💡</span>
+                    <span><strong className="text-white/40">Filter</strong> applies to loaded stocks. <strong className="text-violet-300">Search Full Market</strong> uses AI to scan the entire exchange for your criteria.</span>
+                  </div>
                 </div>
               )}
-
-              {/* FIX #28: proper empty state */}
               {stocks.length === 0 && !screenLoading && screeningCount === 0 && (
                 <div className="text-center py-16 text-white/30">
                   <div className="text-5xl mb-4">🔍</div>
@@ -1791,9 +1868,66 @@ function AppInner() {
                           const isUp = posPnl >= 0;
                           return (
                             <tr key={tk} className="border-t border-white/5 hover:bg-white/[0.02] transition-colors cursor-pointer"
-                              onClick={() => {
-                                const s = stocks.find(s => s.ticker === tk) ?? null;
-                                if (s) setOrderStock(s);
+                              onClick={async () => {
+                                // Try screener cache first, then build from position + live price
+                                const cached = allStocks.find(s => s.ticker === tk);
+                                if (cached) { setOrderStock(cached); return; }
+                                // Build a StockCard from position data with live price fetch
+                                try {
+                                  const [priceRes, sigRes] = await Promise.all([
+                                    fetch(`/api/prices?tickers=${encodeURIComponent(tk)}`),
+                                    fetch(`/api/signals?ticker=${encodeURIComponent(tk)}&price=${pos.currentPrice}&name=${encodeURIComponent(pos.name)}&exchange=${encodeURIComponent(pos.exchange)}&sector=${encodeURIComponent(pos.sector)}`),
+                                  ]);
+                                  const prices = await priceRes.json();
+                                  const sig = sigRes.ok ? await sigRes.json() : {};
+                                  const mkt = prices[tk] ?? prices[tk.replace('.AX','').replace('-USD','')] ?? {};
+                                  setOrderStock({
+                                    ticker: tk,
+                                    name: sig.name || pos.name || tk,
+                                    price: mkt.price || pos.currentPrice,
+                                    change1d: mkt.change1d || 0,
+                                    change52w: mkt.change52w || 0,
+                                    marketCap: mkt.marketCap || 'N/A',
+                                    currency: mkt.currency || 'USD',
+                                    exchange: mkt.exchange || pos.exchange || 'NYSE',
+                                    sector: mkt.sector || pos.sector || 'Equity',
+                                    source: mkt.source || 'Yahoo Finance',
+                                    history: mkt.history || [],
+                                    high52w: mkt.high52w || 0,
+                                    low52w: mkt.low52w || 0,
+                                    volume: mkt.volume || 0,
+                                    conviction: sig.conviction || 5,
+                                    upside: sig.upside || 10,
+                                    recommendation: sig.recommendation || 'Hold',
+                                    riskLevel: sig.riskLevel || 'Medium',
+                                    rsiEstimate: sig.rsiEstimate || 50,
+                                    macdSignal: sig.macdSignal || 'Neutral',
+                                    trend: sig.trend || 'Sideways',
+                                    candleSignal: sig.candleSignal || 'None',
+                                    entryPrice: sig.entryPrice || pos.currentPrice,
+                                    stopLoss: sig.stopLoss || pos.stopLoss || pos.currentPrice * 0.92,
+                                    targetPrice: sig.targetPrice || pos.currentPrice * 1.2,
+                                    thesis: sig.thesis || '',
+                                    risks: sig.risks || '',
+                                    catalysts: sig.catalysts || [],
+                                  });
+                                } catch {
+                                  // Fallback: open modal with position data only
+                                  setOrderStock({
+                                    ticker: tk, name: pos.name, price: pos.currentPrice,
+                                    change1d: 0, change52w: 0, marketCap: 'N/A',
+                                    currency: 'USD', exchange: pos.exchange || 'NYSE',
+                                    sector: pos.sector || 'Equity', source: 'Portfolio',
+                                    history: [], high52w: 0, low52w: 0, volume: 0,
+                                    conviction: 5, upside: 10, recommendation: 'Hold',
+                                    riskLevel: 'Medium', rsiEstimate: 50,
+                                    macdSignal: 'Neutral', trend: 'Sideways', candleSignal: 'None',
+                                    entryPrice: pos.avgPrice,
+                                    stopLoss: pos.stopLoss || pos.currentPrice * 0.92,
+                                    targetPrice: pos.currentPrice * 1.2,
+                                    thesis: '', risks: '', catalysts: [],
+                                  });
+                                }
                               }}>
                               <td className="px-3 py-3"><span className="font-mono text-xs bg-[#1f1f2e] border border-white/10 rounded px-2 py-0.5">{tk}</span></td>
                               <td className="px-3 py-3 text-xs text-white/45 max-w-[100px] truncate">{pos.name}</td>
