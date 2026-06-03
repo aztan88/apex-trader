@@ -545,7 +545,15 @@ async function executeBuys(
   const slotsAvailable = maxPositions - Object.keys(store.current().positions).length;
   if (slotsAvailable <= 0) { addLog('💼 Max positions reached'); return; }
 
-  const toEvaluate = candidates.slice(0, Math.min(slotsAvailable + 2, 5));
+  // Filter out tickers already held (including with/without suffixes)
+  const heldTickers = Object.keys(store.current().positions);
+  const freshCandidates = candidates.filter(c => {
+    const base = c.ticker.replace('.AX','').replace('-USD','');
+    return !heldTickers.includes(c.ticker) && !heldTickers.includes(base);
+  });
+  if (!freshCandidates.length) { addLog('📊 All candidates already held'); return; }
+
+  const toEvaluate = freshCandidates.slice(0, Math.min(slotsAvailable + 2, 5));
   addLog(`💰 Evaluating ${toEvaluate.length} candidates with live prices…`);
 
   const tickerList = toEvaluate.map((d: any) => d.ticker).join(',');
@@ -580,8 +588,11 @@ async function executeBuys(
       const sl = parseFloat((price * (1 - stopPct / 100)).toFixed(2));
       const tp = parseFloat((price * (1 + tpPct / 100)).toFixed(2));
 
+      // Keep full ticker including exchange suffix (.AX, -USD) so price refreshes
+      // correctly match the same ticker that was bought
+      const storeTicker = candidate.ticker; // e.g. BHP.AX, BTC-USD
       const ok = store.buy({
-        ticker: candidate.ticker.replace('.AX','').replace('-USD',''),
+        ticker: storeTicker,
         name: candidate.name || candidate.ticker,
         price, exchange: mkt.exchange || 'NYSE',
         sector: mkt.sector || 'Equity',
@@ -671,6 +682,13 @@ async function runAutopilotCycle(
 
   if (!hasCapacity) {
     addLog(`💼 ${updatedKeys.length}/${maxPositions} positions, $${updatedCash.toFixed(0)} cash — holding`);
+    return;
+  }
+
+  // Don't re-buy anything we just sold this cycle — wait for next cycle
+  const justSold = [...sold, ...trimmed];
+  if (justSold.length > 0) {
+    addLog(`⏳ Sold ${justSold.join(', ')} — skipping re-buy this cycle to avoid churn`);
     return;
   }
 
@@ -1123,6 +1141,8 @@ function AppInner() {
 
       try {
         // Build ticker list using original exchange-suffixed tickers where possible
+        // Use stored tickers directly - they include .AX / -USD suffixes
+        // so Yahoo Finance fetches the correct exchange price
         const tickerList = tickers.join(',');
         const res = await fetch(`/api/prices?tickers=${encodeURIComponent(tickerList)}`, {
           signal: AbortSignal.timeout(20000),
@@ -1556,6 +1576,8 @@ function AppInner() {
                         setStocks([]);
                         setScreenStatus('🔍 AI scanning full market for your filters…');
                         try {
+                          // Step 1: Get candidate tickers based on filter character
+                          setScreenStatus('🧠 AI generating candidate list based on your filters…');
                           const res = await fetch('/api/screener', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
@@ -1564,28 +1586,37 @@ function AppInner() {
                               conviction: filterConviction,
                               risk: filterRisk, recommendation: filterRec,
                               macd: filterMacd, trend: filterTrend,
-                              count: 20,
                             }),
                           });
                           const data = await res.json();
                           if (!data.tickers?.length) {
-                            setScreenStatus('No stocks found matching those filters');
+                            setScreenStatus('No candidates returned — try broader filters');
                             setScreenLoading(false);
                             return;
                           }
-                          setScreenStatus(`Found ${data.tickers.length} matches — fetching prices…`);
-                          // Fetch prices then signals
-                          const priceMap = await fetch(`/api/prices?tickers=${encodeURIComponent(data.tickers.join(','))}`).then(r => r.json());
-                          const successfulPrices = Object.values(priceMap).filter((v: any) => v.price > 0).length;
-                          if (!successfulPrices) { setScreenStatus('No price data returned'); setScreenLoading(false); return; }
-                          setScreenStatus(`Prices loaded — generating AI signals…`);
-                          const results: StockCard[] = [];
-                          for (const tk of data.tickers) {
+
+                          // Step 2: Fetch real prices for all candidates in parallel
+                          setScreenStatus(`Fetching prices for ${data.tickers.length} candidates…`);
+                          const priceMap = await fetch(`/api/prices?tickers=${encodeURIComponent(data.tickers.join(','))}`).then(r => r.json()).catch(() => ({}));
+                          const enrichedMap: Record<string,any> = {};
+                          (data.enriched ?? []).forEach((e: any) => { enrichedMap[e.ticker] = e; });
+                          const validTickers = data.tickers.filter((tk: string) => {
+                            const m = priceMap[tk] ?? priceMap[tk.replace('.AX','').replace('-USD','')];
+                            const tv = enrichedMap[tk];
+                            return (m?.price > 0) || (tv?.price > 0);
+                          });
+                          if (!validTickers.length) { setScreenStatus('No price data available — try again'); setScreenLoading(false); return; }
+                          setScreenStatus(`${validTickers.length} stocks loaded — adding AI thesis & applying filters…`);
+
+                          // Step 3: Fetch signals and apply EXACT filter values to real data
+                          const allResults: StockCard[] = [];
+                          const matchingResults: StockCard[] = [];
+                          for (const tk of validTickers) {
                             const mkt = priceMap[tk] ?? priceMap[tk.replace('.AX','').replace('-USD','')];
                             if (!mkt || !mkt.price || mkt.price <= 0) continue;
                             try {
                               const sig = await fetch(`/api/signals?ticker=${encodeURIComponent(tk)}&price=${mkt.price}&name=${encodeURIComponent(mkt.name||tk)}&exchange=${encodeURIComponent(mkt.exchange||'NYSE')}&sector=${encodeURIComponent(mkt.sector||'Equity')}&marketCap=${encodeURIComponent(mkt.marketCap||'N/A')}&change52w=${mkt.change52w||0}&high52w=${mkt.high52w||0}&low52w=${mkt.low52w||0}`).then(r => r.json());
-                              results.push({
+                              const card: StockCard = {
                                 ticker: tk.replace('.AX','').replace('-USD',''),
                                 name: sig.name || mkt.name || tk,
                                 price: mkt.price, change1d: mkt.change1d, change52w: mkt.change52w,
@@ -1593,13 +1624,38 @@ function AppInner() {
                                 sector: mkt.sector, source: mkt.source, history: mkt.history ?? [],
                                 high52w: mkt.high52w??0, low52w: mkt.low52w??0, volume: mkt.volume??0,
                                 ...sig,
-                              });
-                              setAllStocks([...results]);
-                              setStocks([...results]);
+                              };
+                              allResults.push(card);
+
+                              // Apply EXACT filter checks against real signal values
+                              const rsiOk = card.rsiEstimate >= filterRsiMin && card.rsiEstimate <= filterRsiMax;
+                              const convOk = filterConviction === 0 || card.conviction >= filterConviction;
+                              const riskOk = filterRisk.length === 0 || filterRisk.includes(card.riskLevel);
+                              const recOk = filterRec.length === 0 || filterRec.some(r => card.recommendation.includes(r));
+                              const macdOk = filterMacd.length === 0 || filterMacd.some(m => card.macdSignal.includes(m));
+                              const trendOk = filterTrend.length === 0 || filterTrend.some(t => card.trend.includes(t));
+
+                              if (rsiOk && convOk && riskOk && recOk && macdOk && trendOk) {
+                                matchingResults.push(card);
+                              }
+                              // Show all candidates loading, then filter at end
+                              setStocks([...allResults]);
+                              setScreenStatus(`Screened ${allResults.length}/${validTickers.length} · ${matchingResults.length} match filters…`);
                             } catch { continue; }
                             await new Promise(r => setTimeout(r, 80));
                           }
-                          setScreenStatus(`${results.length} stocks matching your filters · AI-powered market scan`);
+
+                          // Show filtered results if any match, otherwise show all with note
+                          if (matchingResults.length > 0) {
+                            setAllStocks(matchingResults);
+                            setStocks(matchingResults);
+                            setScreenStatus(`✓ ${matchingResults.length} stocks match your exact filters (from ${allResults.length} screened)`);
+                          } else {
+                            setAllStocks(allResults);
+                            setStocks(allResults);
+                            setScreenStatus(`No exact matches found — showing all ${allResults.length} candidates. Try wider filter ranges.`);
+                            showToast('No exact matches — showing closest candidates', 'info');
+                          }
                         } catch (e: any) {
                           setScreenStatus('Filter search error: ' + e.message);
                         }

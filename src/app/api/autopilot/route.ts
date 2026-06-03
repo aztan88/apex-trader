@@ -70,7 +70,9 @@ export async function POST(req: NextRequest) {
       forceRefresh = false,
     } = body;
 
-    const cacheKey = `${risk}:${sectors.join(',')}:${minConviction}`;
+    // Sort existingTickers so cache key is stable regardless of order
+    const sortedExisting = [...(existingTickers ?? [])].sort().join(',');
+    const cacheKey = `${risk}:${sectors.join(',')}:${minConviction}:${sortedExisting}`;
 
     if (!forceRefresh) {
       const cached = discoveryCache.get(cacheKey);
